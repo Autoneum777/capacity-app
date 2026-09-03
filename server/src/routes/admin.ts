@@ -36,7 +36,11 @@ import {
   importMachinesFromBuffer,
   MACHINES_IMPORT_CONFIRM,
 } from '../services/machineImportService.js';
-import { generateOcuKatowiceWorkbook } from '../services/ocuDataExportService.js';
+import {
+  generateOcuKatowiceWorkbook,
+  previewKatowiceInputHeaders,
+} from '../services/ocuDataExportService.js';
+import type { OcuColumnLetters } from '../services/ocuColumnMapping.js';
 
 export const adminRouter = Router();
 
@@ -639,8 +643,47 @@ const ocuUpload = multer({
 });
 
 /**
+ * Podgląd nagłówków arkusza Input (do mapowania kolumn w UI).
+ * multipart: katowice (+ opcjonalnie hasło / bieżące mapowanie JSON)
+ */
+adminRouter.post(
+  '/ocu-data/preview-headers',
+  ocuUpload.fields([{ name: 'katowice', maxCount: 1 }]),
+  (req, res) => {
+    void (async () => {
+      try {
+        const files = req.files as { katowice?: Express.Multer.File[] } | undefined;
+        const katowice = files?.katowice?.[0];
+        if (!katowice?.buffer?.length) {
+          return res.status(400).json({ error: 'Brak pliku Katowice_Data (pole: katowice).' });
+        }
+        const headerPwd = String(req.get('x-katowice-password') ?? '').trim();
+        const bodyPwd = String(req.body?.katowicePassword ?? req.body?.password ?? '').trim();
+        const katowicePassword = headerPwd || bodyPwd;
+        let columnMapping: Partial<OcuColumnLetters> | null = null;
+        const rawMap = req.body?.columnMapping;
+        if (typeof rawMap === 'string' && rawMap.trim()) {
+          try {
+            columnMapping = JSON.parse(rawMap) as Partial<OcuColumnLetters>;
+          } catch {
+            columnMapping = null;
+          }
+        }
+        const preview = await previewKatowiceInputHeaders(katowice.buffer, {
+          katowicePassword: katowicePassword || null,
+          columnMapping,
+        });
+        return res.json(preview);
+      } catch (e: any) {
+        return res.status(400).json({ error: e?.message || 'Nie udało się odczytać nagłówków Input.' });
+      }
+    })();
+  }
+);
+
+/**
  * Generuje uzupełniony Katowice_Data (X/AB/AC/AD/AE + AF–AN S1619 + CR–DO S2102 z routingu).
- * multipart: transition, katowice, routing
+ * multipart: transition, katowice, routing (+ opcjonalnie columnMapping JSON)
  */
 adminRouter.post(
   '/ocu-data/generate',
@@ -671,10 +714,26 @@ adminRouter.post(
         if (!routing?.buffer?.length) {
           return res.status(400).json({ error: 'Brak pliku routingu SAP (pole: routing).' });
         }
+        const headerPwd = String(req.get('x-katowice-password') ?? '').trim();
+        const bodyPwd = String(req.body?.katowicePassword ?? req.body?.password ?? '').trim();
+        const katowicePassword = headerPwd || bodyPwd;
+        let columnMapping: Partial<OcuColumnLetters> | null = null;
+        const rawMap = req.body?.columnMapping;
+        if (typeof rawMap === 'string' && rawMap.trim()) {
+          try {
+            columnMapping = JSON.parse(rawMap) as Partial<OcuColumnLetters>;
+          } catch {
+            return res.status(400).json({ error: 'Nieprawidłowe mapowanie kolumn (columnMapping).' });
+          }
+        }
         const result = await generateOcuKatowiceWorkbook(
           transition.buffer,
           katowice.buffer,
-          routing.buffer
+          routing.buffer,
+          {
+            katowicePassword: katowicePassword || null,
+            columnMapping,
+          }
         );
         res.setHeader('Content-Type', 'application/zip');
         res.setHeader('Content-Disposition', `attachment; filename="${result.filename}"`);

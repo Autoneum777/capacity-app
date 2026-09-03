@@ -1,5 +1,5 @@
 import { db, saveDb } from '../db/connection.js';
-import { weekOfMonthFromDate } from '../utils/sopEopFormat.js';
+import { assignIsoWeekToStartMonth } from '../utils/sopEopFormat.js';
 import {
   deleteCallOffSourceFiles,
   getCallOffSourceFilePath,
@@ -361,15 +361,16 @@ export function loadCallOffVolumeMaps(comparisonId: number): CallOffVolumeMaps {
     const year = Number(r.year);
     const month = Number(r.month);
     const day = Number(String(r.volume_date ?? '').slice(8, 10));
-    const wom = weekOfMonthFromDate(year, month, day);
+    // Cały wolumen tygodnia → miesiąc, w którym tydzień się zaczyna (poniedziałek).
+    const home = assignIsoWeekToStartMonth(year, month, Number.isFinite(day) && day > 0 ? day : 1);
     const qty = Number(r.qty) || 0;
     if (!weekly.has(partId)) weekly.set(partId, new Map());
     const byYear = weekly.get(partId)!;
-    if (!byYear.has(year)) byYear.set(year, new Map());
-    const byMonth = byYear.get(year)!;
-    if (!byMonth.has(month)) byMonth.set(month, new Map());
-    const byWeek = byMonth.get(month)!;
-    byWeek.set(wom, (byWeek.get(wom) ?? 0) + qty);
+    if (!byYear.has(home.year)) byYear.set(home.year, new Map());
+    const byMonth = byYear.get(home.year)!;
+    if (!byMonth.has(home.month)) byMonth.set(home.month, new Map());
+    const byWeek = byMonth.get(home.month)!;
+    byWeek.set(home.week, (byWeek.get(home.week) ?? 0) + qty);
   }
 
   return { annual, monthly, weekly };

@@ -25,7 +25,7 @@ app.use(
   cors({
     origin: true,
     credentials: true,
-    exposedHeaders: ['Content-Disposition', 'X-Capacity-Data-Import-Schema'],
+    exposedHeaders: ['Content-Disposition', 'X-Capacity-Data-Import-Schema', 'X-OCU-Stats'],
   }),
 );
 app.use(compression({ threshold: 1024 }));

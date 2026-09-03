@@ -46,6 +46,10 @@ const ERROR_KEY_BY_MESSAGE: Record<string, string> = {
   'Podaj numer linii (tylko cyfry, liczba całkowita)': 'errors.provideLineNumber',
   'Machine usage musi być liczbą z zakresu 0..1': 'errors.machineUsageRange',
   'FOREIGN KEY constraint failed': 'errors.machineRequired',
+  'File is password-protected': 'admin.ocuDataFilePasswordProtected',
+  'Plik Katowice_Data jest zaszyfrowany hasłem otwarcia. Podaj hasło w polu poniżej (nie da się go ominąć bez hasła).':
+    'admin.ocuDataFilePasswordProtected',
+  'Nie udało się odszyfrować pliku — sprawdź hasło otwarcia Katowice_Data.': 'admin.ocuDataFilePasswordWrong',
 };
 
 const PREFIX_RULES: { prefix: string; key: string }[] = [
@@ -63,6 +67,9 @@ export function translateApiError(locale: Locale, message: string | undefined | 
   if (raw.includes('FOREIGN KEY')) return translate(locale, 'errors.machineRequired');
   for (const { prefix, key } of PREFIX_RULES) {
     if (raw.startsWith(prefix)) return translate(locale, key, { detail: raw });
+  }
+  if (raw.toLowerCase().includes('password-protected') || raw.toLowerCase().includes('password protected')) {
+    return translate(locale, 'admin.ocuDataFilePasswordProtected');
   }
   return raw;
 }

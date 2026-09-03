@@ -303,7 +303,7 @@ capacityRouter.get('/calculator', (req, res) => {
   }
 
   const useScenarioCallOffVolumes =
-    ctx.scenarioCallOffComparisonId != null && !useContractualVolumes && ctx.scenarioBundle != null;
+    ctx.scenarioCallOffComparisonId != null && ctx.scenarioBundle != null;
 
   if (!useScenarioCallOffVolumes) {
     const cacheKey = calculatorCacheKey({
@@ -444,7 +444,7 @@ capacityRouter.get('/calculator/period-breakdown', (req, res) => {
   }
 
   const useScenarioCallOffVolumes =
-    ctx.scenarioCallOffComparisonId != null && !useContractualVolumes && ctx.scenarioBundle != null;
+    ctx.scenarioCallOffComparisonId != null && ctx.scenarioBundle != null;
 
   if (!useScenarioCallOffVolumes) {
     const cacheKey = calculatorCacheKey({

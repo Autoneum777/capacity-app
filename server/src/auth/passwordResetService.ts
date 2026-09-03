@@ -3,6 +3,11 @@ import { generateSecureToken, hashToken } from '../auth/session.js';
 
 const DEFAULT_TTL_HOURS = Number(process.env.PASSWORD_RESET_TTL_HOURS ?? 24);
 
+export type AppBaseUrlRequest = {
+  get: (name: string) => string | undefined;
+  protocol?: string;
+};
+
 export function resetTokenExpiresAt(): string {
   const d = new Date();
   d.setHours(d.getHours() + DEFAULT_TTL_HOURS);
@@ -43,13 +48,93 @@ export function createPasswordResetRequest(userId: number): number {
   return Number(r.lastInsertRowid);
 }
 
-export function getAppBaseUrl(): string {
-  const row = db.prepare(`SELECT value FROM admin_settings WHERE key = 'app_base_url'`).get() as { value?: string } | undefined;
-  const fromDb = String(row?.value ?? '').trim();
-  if (fromDb) return fromDb.replace(/\/+$/, '');
-  return String(process.env.APP_BASE_URL ?? 'http://localhost:5173').replace(/\/+$/, '');
+function normalizeBaseUrl(raw: string): string {
+  return String(raw ?? '')
+    .trim()
+    .replace(/\/+$/, '');
 }
 
-export function buildResetPasswordUrl(token: string): string {
-  return `${getAppBaseUrl()}/reset-hasla?token=${encodeURIComponent(token)}`;
+export function isLoopbackBaseUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]';
+  } catch {
+    return /localhost|127\.0\.0\.1/i.test(url);
+  }
+}
+
+/** Jawna konfiguracja (admin_settings / ENV). Ignoruje puste. */
+export function getConfiguredAppBaseUrl(): string | null {
+  const row = db.prepare(`SELECT value FROM admin_settings WHERE key = 'app_base_url'`).get() as
+    | { value?: string }
+    | undefined;
+  const fromDb = normalizeBaseUrl(String(row?.value ?? ''));
+  const fromEnv = normalizeBaseUrl(String(process.env.APP_BASE_URL ?? ''));
+  // Migracja 059 wstawia localhost:3001 — nie wolno tego preferować nad sensownym ENV.
+  if (fromEnv && !isLoopbackBaseUrl(fromEnv)) return fromEnv;
+  if (fromDb && !isLoopbackBaseUrl(fromDb)) return fromDb;
+  if (fromEnv) return fromEnv;
+  if (fromDb) return fromDb;
+  return null;
+}
+
+/** Publiczny URL z nagłówków przeglądarki / proxy (Origin, Referer, X-Forwarded-*). */
+export function baseUrlFromRequest(req: AppBaseUrlRequest): string | null {
+  const origin = String(req.get('origin') ?? '').trim();
+  if (origin && /^https?:\/\//i.test(origin)) return normalizeBaseUrl(origin);
+
+  const referer = String(req.get('referer') ?? '').trim();
+  if (referer) {
+    try {
+      const u = new URL(referer);
+      return normalizeBaseUrl(`${u.protocol}//${u.host}`);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const xfHost = String(req.get('x-forwarded-host') ?? '')
+    .split(',')[0]
+    .trim();
+  if (xfHost) {
+    const xfProto =
+      String(req.get('x-forwarded-proto') ?? 'https')
+        .split(',')[0]
+        .trim() || 'https';
+    return normalizeBaseUrl(`${xfProto}://${xfHost}`);
+  }
+
+  const host = String(req.get('host') ?? '').trim();
+  if (host) {
+    const proto =
+      String(req.get('x-forwarded-proto') ?? '')
+        .split(',')[0]
+        .trim() || (req.protocol === 'https' ? 'https' : 'http');
+    return normalizeBaseUrl(`${proto}://${host}`);
+  }
+  return null;
+}
+
+/**
+ * Publiczny bazowy URL aplikacji do linków resetu hasła.
+ * Priorytet: nie-loopback config → URL z requestu → config (nawet localhost) → fallback.
+ */
+export function resolvePublicAppBaseUrl(req?: AppBaseUrlRequest | null): string {
+  const configured = getConfiguredAppBaseUrl();
+  const fromReq = req ? baseUrlFromRequest(req) : null;
+
+  if (fromReq && (!configured || isLoopbackBaseUrl(configured))) return fromReq;
+  if (configured && !isLoopbackBaseUrl(configured)) return configured;
+  if (fromReq) return fromReq;
+  if (configured) return configured;
+  return 'http://localhost:5173';
+}
+
+/** @deprecated Użyj resolvePublicAppBaseUrl(req) — bez req może zostać localhost z migracji. */
+export function getAppBaseUrl(): string {
+  return resolvePublicAppBaseUrl(null);
+}
+
+export function buildResetPasswordUrl(token: string, req?: AppBaseUrlRequest | null): string {
+  return `${resolvePublicAppBaseUrl(req)}/reset-hasla?token=${encodeURIComponent(token)}`;
 }

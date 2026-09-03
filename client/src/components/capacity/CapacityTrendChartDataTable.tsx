@@ -70,6 +70,28 @@ function findDetail(
   return findProject(series, client, projectId)?.details.find((d) => d.detail_label === detailLabel);
 }
 
+/**
+ * Udział w obciążeniu okresu: wartość z wykresu (miesiąc/tydzień/rok) × share_percent / 100.
+ * Dzięki temu klienci sumują się do miesiąca, projekty do klienta, detale do projektu.
+ */
+function contributionOfPeriod(
+  periodAnchor: number | null | undefined,
+  node: { load_percent?: number; share_percent?: number } | undefined,
+  seriesLoadPercent: number | null | undefined
+): number | null {
+  if (periodAnchor == null || !Number.isFinite(periodAnchor) || !node) return null;
+  const share = Number(node.share_percent);
+  if (Number.isFinite(share)) {
+    return Math.round(periodAnchor * (share / 100) * 100) / 100;
+  }
+  const nodeLoad = Number(node.load_percent);
+  const seriesLoad = Number(seriesLoadPercent);
+  if (Number.isFinite(nodeLoad) && Number.isFinite(seriesLoad) && Math.abs(seriesLoad) > 1e-9) {
+    return Math.round(periodAnchor * (nodeLoad / seriesLoad) * 100) / 100;
+  }
+  return Number.isFinite(nodeLoad) ? nodeLoad : null;
+}
+
 function unionClientsFromBreakdowns(breakdowns: BreakdownResponse[]): BreakdownClient[] {
   const byClient = new Map<string, BreakdownClient>();
   for (const breakdown of breakdowns) {
@@ -365,7 +387,8 @@ export default function CapacityTrendChartDataTable({
 
   const chevron = (open: boolean) => (open ? '▾' : '▸');
 
-  const renderBreakdownRows = (yearData: BreakdownYearData, year: number) => {
+  const renderBreakdownRows = (yearData: BreakdownYearData, periodRow: TrendChartRow) => {
+    const year = periodRow.year;
     const allBreakdowns = [...(yearData.common ? [yearData.common] : []), ...Array.from(yearData.callOffById.values())];
     const clients = unionClientsFromBreakdowns(allBreakdowns);
     if (!clients.length) {
@@ -387,6 +410,16 @@ export default function CapacityTrendChartDataTable({
         if (callOffId != null) return yearData.callOffById.get(callOffId);
         return yearData.common;
       };
+      const cellValue = (
+        seriesKey: string,
+        node: { load_percent?: number; share_percent?: number } | undefined
+      ): number | null => {
+        const bk = seriesBreakdownKey(seriesKey);
+        const seriesBreakdown = breakdownForSeries(seriesKey);
+        const seriesData = bk && seriesBreakdown ? seriesBreakdown.series[bk] : undefined;
+        const periodAnchor = periodRow[seriesKey] as number | null | undefined;
+        return contributionOfPeriod(periodAnchor, node, seriesData?.load_percent);
+      };
       const clientKey = `${year}|${clientNode.client}`;
       const clientOpen = expandedClients.has(clientKey);
       const clientBg = '#fafafa';
@@ -406,7 +439,7 @@ export default function CapacityTrendChartDataTable({
             const bk = seriesBreakdownKey(s.key);
             const seriesBreakdown = breakdownForSeries(s.key);
             const node = bk && seriesBreakdown ? findClient(seriesBreakdown.series[bk], clientNode.client) : undefined;
-            return <SeriesValueCell key={s.key} series={s} value={node?.load_percent} background={clientBg} metricMode={metricMode} />;
+            return <SeriesValueCell key={s.key} series={s} value={cellValue(s.key, node)} background={clientBg} metricMode={metricMode} />;
           })}
         </tr>,
       ];
@@ -436,7 +469,7 @@ export default function CapacityTrendChartDataTable({
                 bk && seriesBreakdown
                   ? findProject(seriesBreakdown.series[bk], clientNode.client, projectNode.project_id)
                   : undefined;
-              return <SeriesValueCell key={s.key} series={s} value={node?.load_percent} background={projectBg} metricMode={metricMode} />;
+              return <SeriesValueCell key={s.key} series={s} value={cellValue(s.key, node)} background={projectBg} metricMode={metricMode} />;
             })}
           </tr>
         );
@@ -461,7 +494,7 @@ export default function CapacityTrendChartDataTable({
                     && seriesBreakdown
                     ? findDetail(seriesBreakdown.series[bk], clientNode.client, projectNode.project_id, detailNode.detail_label)
                     : undefined;
-                  return <SeriesValueCell key={s.key} series={s} value={node?.load_percent} background={detailBg} metricMode={metricMode} />;
+                  return <SeriesValueCell key={s.key} series={s} value={cellValue(s.key, node)} background={detailBg} metricMode={metricMode} />;
                 })}
               </tr>
             );
@@ -563,7 +596,7 @@ export default function CapacityTrendChartDataTable({
                   </td>
                 </tr>
               )}
-              {canExpand && yearOpen && !loading && !error && breakdown && renderBreakdownRows(breakdown, row.year)}
+              {canExpand && yearOpen && !loading && !error && breakdown && renderBreakdownRows(breakdown, row)}
             </tbody>
           );
         })}

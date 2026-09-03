@@ -34,6 +34,16 @@ type ResetRequest = {
 
 type UserSortCol = 'display' | 'username' | 'email' | 'roles' | 'status';
 
+/** Link resetu zawsze względem originu, z którego korzysta administrator (nie localhost z konfiguracji serwera). */
+function toBrowserResetUrl(serverUrl: string): string {
+  try {
+    const parsed = new URL(serverUrl, window.location.origin);
+    return `${window.location.origin}${parsed.pathname}${parsed.search}`;
+  } catch {
+    return serverUrl;
+  }
+}
+
 export default function AdminUsers() {
   const { t } = useI18n();
   const { hasPermission } = useAuth();
@@ -82,10 +92,23 @@ export default function AdminUsers() {
     setDisplayName('');
     setPassword('');
     setIsActive(true);
-    setRoleIds(roles.length ? [roles[0].id] : []);
+    setRoleIds([]);
     setResetLink(null);
     setError(null);
     setModal('new');
+    // Przeglądarka czasem wstawia login/hasło po mount — wyczyść jeszcze raz.
+    requestAnimationFrame(() => {
+      setUsername('');
+      setPassword('');
+      setEmail('');
+      setDisplayName('');
+    });
+    window.setTimeout(() => {
+      setUsername('');
+      setPassword('');
+      setEmail('');
+      setDisplayName('');
+    }, 50);
   };
 
   const openEdit = (u: AuthUser) => {
@@ -152,7 +175,7 @@ export default function AdminUsers() {
     setError(null);
     try {
       const r = await api.adminUsers.resetPassword(editingUser.id, false);
-      setResetLink(r.reset_url);
+      setResetLink(toBrowserResetUrl(r.reset_url));
     } catch (err: any) {
       setError(err?.message || t('auth.resetLinkFailed'));
     }
@@ -163,7 +186,7 @@ export default function AdminUsers() {
     setError(null);
     try {
       const r = await api.adminUsers.resolveResetRequest(id, action, { send_email: false });
-      if (r.reset_url) setResetLink(r.reset_url);
+      if (r.reset_url) setResetLink(toBrowserResetUrl(r.reset_url));
       await load();
     } catch (err: any) {
       setError(err?.message || t('auth.resetRequestFailed'));
@@ -336,19 +359,47 @@ export default function AdminUsers() {
 
       {modal != null && (
         <AdminModal title={modal === 'new' ? t('auth.newUser') : t('auth.editUser')} onClose={closeModal}>
-          <form onSubmit={onSave}>
+          <form autoComplete="off" onSubmit={onSave}>
             {error && <p style={{ color: 'var(--cap-red)', marginTop: 0 }}>{error}</p>}
+            {modal === 'new' && (
+              <div aria-hidden style={{ position: 'absolute', left: -10000, top: 'auto', width: 1, height: 1, overflow: 'hidden' }}>
+                <input type="text" name="fake-username" autoComplete="username" tabIndex={-1} defaultValue="" />
+                <input type="password" name="fake-password" autoComplete="current-password" tabIndex={-1} defaultValue="" />
+              </div>
+            )}
             <label style={{ display: 'block', marginBottom: 12 }}>
               {t('auth.displayNameField')}
-              <input value={displayName} onChange={(e) => setDisplayName(e.target.value)} disabled={!canEdit} style={adminInputStyle} />
+              <input
+                name="capacity_display_name"
+                autoComplete="off"
+                value={displayName}
+                onChange={(e) => setDisplayName(e.target.value)}
+                disabled={!canEdit}
+                style={adminInputStyle}
+              />
             </label>
             <label style={{ display: 'block', marginBottom: 12 }}>
               {t('auth.usernameField')}
-              <input value={username} onChange={(e) => setUsername(e.target.value)} disabled={!canEdit} style={adminInputStyle} />
+              <input
+                name="capacity_new_username"
+                autoComplete={modal === 'new' ? 'off' : 'username'}
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                disabled={!canEdit}
+                style={adminInputStyle}
+              />
             </label>
             <label style={{ display: 'block', marginBottom: 12 }}>
               {t('auth.emailField')}
-              <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} disabled={!canEdit} style={adminInputStyle} />
+              <input
+                type="email"
+                name="capacity_email"
+                autoComplete="off"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                disabled={!canEdit}
+                style={adminInputStyle}
+              />
             </label>
             <fieldset style={{ border: '1px solid #e0e0e0', borderRadius: 6, padding: '10px 12px', marginBottom: 12 }}>
               <legend style={{ padding: '0 4px', fontSize: 13, fontWeight: 600 }}>{t('auth.rolesField')}</legend>
@@ -363,8 +414,7 @@ export default function AdminUsers() {
                       onChange={(e) => {
                         setRoleIds((prev) => {
                           if (e.target.checked) return [...prev, r.id].sort((a, b) => a - b);
-                          const next = prev.filter((id) => id !== r.id);
-                          return next.length > 0 ? next : prev;
+                          return prev.filter((id) => id !== r.id);
                         });
                       }}
                     />
@@ -376,7 +426,16 @@ export default function AdminUsers() {
             {modal === 'new' && (
               <label style={{ display: 'block', marginBottom: 12 }}>
                 {t('auth.initialPasswordField')}
-                <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required disabled={!canEdit} style={adminInputStyle} />
+                <input
+                  type="password"
+                  name="capacity_new_password"
+                  autoComplete="new-password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  required
+                  disabled={!canEdit}
+                  style={adminInputStyle}
+                />
               </label>
             )}
             {editingUser && (

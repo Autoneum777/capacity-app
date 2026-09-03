@@ -137,7 +137,30 @@ export const en: TranslationTree = {
     ocuDataTransitionHelp: '.xlsx — column B = Sonar Part Code, C = ERP, D = Year. ZIP includes a copy without filters.',
     ocuDataKatowiceTitle: '2. Katowice_Data',
     ocuDataKatowiceHelp:
-      '.xlsx / .xlsm — Input sheet. S = Sonar Part Code, E = year. Filled: X, AB, AC, AD, AE (AE = nest count). OCU output: .xlsx without macros, Input only.',
+      '.xlsx / .xlsm — Input sheet. Configure read/write columns below after loading headers from the file. OCU output: .xlsx without macros, Input only.',
+    ocuDataKatowicePasswordLabel: 'Katowice_Data open password (optional)',
+    ocuDataKatowicePasswordPlaceholder: 'Only if the file is encrypted',
+    ocuDataKatowicePasswordHelp:
+      'An open password cannot be bypassed. Fill this field only when generation reports that the file is password-protected.',
+    ocuDataFilePasswordProtected:
+      'Katowice_Data is encrypted with an open password. Enter the password in the field below (it cannot be bypassed).',
+    ocuDataFilePasswordWrong: 'Could not decrypt the file — check the Katowice_Data open password.',
+    ocuColMappingTitle: 'Input sheet column mapping',
+    ocuColMappingHelp:
+      'Labels come from file headers. If a column was added after “Sonar Part Code” (S), use “Shift +1 columns after S” so X/AB/… and routing letters move right. Mapping is saved in the browser.',
+    ocuColLoadHeaders: 'Load headers from file',
+    ocuColLoadingHeaders: 'Loading headers…',
+    ocuColShiftAfterS: 'Shift +1 columns after S',
+    ocuColResetDefaults: 'Restore default letters',
+    ocuColHeadersLoaded: 'Headers from row {{row}} ({{count}} named columns).',
+    ocuColColHeader: 'Column / header',
+    ocuColColLetter: 'Letter',
+    ocuColColFromFile: 'Header in file',
+    ocuColHeaderMissing: 'No header under this letter',
+    ocuColSectionRead: 'Read',
+    ocuColSectionCapacity: 'Capacity write (Opt1cxx)',
+    ocuColSectionRouting: 'Routing write (S1619 / S2102)',
+    ocuDataPreviewFailed: 'Could not load headers from Katowice_Data.',
     ocuDataRoutingTitle: '3. SAP routing',
     ocuDataRoutingHelp:
       '.txt (Task List Print List). S1619 → AK. S2102: material no. → CW/DI, L×W dims → DB+DC / DN+DO, Base Qty → CY/DK. Without S2102: CR–DC / DD–DO = 0 (incl. HL).',
@@ -538,7 +561,8 @@ export const en: TranslationTree = {
     errScopeRequired: 'Enter the scenario scope (required text field).',
     errPickSource: 'Select a source scenario.',
     volumeSection: 'Production volumes',
-    volumeSectionHint: 'Independent of the starting point — affects only volume data in the scenario calculator.',
+    volumeSectionHint:
+      'Independent of the starting point. When enabled, the calculator shows two bars: scenario production on top and Call offs below — like the Call offs view.',
     useCallOffVolumes: 'Use volumes from Call offs (comparison list)',
     pickCallOff: '— select comparison —',
     errPickCallOff: 'Select a Call off comparison with imported volumes.',
@@ -571,9 +595,10 @@ export const en: TranslationTree = {
   },
   calculator: {
     title: 'Calculator',
-    scenarioCallOffBanner: 'Production volumes replaced with Call offs data: {{name}}',
+    scenarioCallOffBanner:
+      'Dual comparison: scenario production load on top, Call offs ({{name}}) below.',
     scenarioCallOffBannerContract:
-      'Year range from Call offs data ({{name}}). Contract mode shows contractual volumes from the scenario.',
+      'Dual comparison: scenario contractual volumes on top, Call offs ({{name}}) below.',
     yearFrom: 'Year from:',
     yearTo: 'Year to:',
     machineType: 'Machine type:',
@@ -667,12 +692,16 @@ export const en: TranslationTree = {
       saveAlt: 'Save alternative',
       execute: 'Execute allocation',
       executeTitle: 'Execute allocation',
-      operation: 'Operation:',
+      operation: 'Operations (parts):',
       operationLine: '{{part}} – {{phase}} (volume {{year}}: {{value}} {{unit}}, sum: {{weekly}} {{weeklyLabel}})',
+      selectedOpsCount: '{{count}} selected',
+      multiSelectHelp:
+        'You can select multiple parts. Manual volume / target % applies to the combined selection (pro-rata by volume). “Full” moves 100% of each selected part.',
+      sopEopUnion: 'Maximum SOP–EOP span for {{count}} parts: {{years}}',
       weeklyLabel: 'weekly',
       transferModeTitle: 'Volume transfer method',
       modeFull: 'Transfer full detail volume',
-      modeFullHelp: 'Moves 100% of the selected detail volume (all operations in the group) for each selected year.',
+      modeFullHelp: 'Moves 100% of each selected detail volume (all operations in the group) for each selected year.',
       modeFullHelpPartial:
         'Moves the year-volume fraction from the selected month/week through year-end (later selected years in full).',
       modeManual: 'Manual volume entry',
@@ -741,7 +770,7 @@ export const en: TranslationTree = {
         ' For years {{years}} volume was capped — detail volume was insufficient to reach target {{percent}}% load (full available volume was transferred).',
       allocationCappedManual: ' For years {{years}} volume was capped to the maximum available detail volume.',
       allocationSkipped: ' Skipped years {{years}} (no possible volume at this target % or volume 0).',
-      selectOpMachineYear: 'Select operation, target machine, and at least one year.',
+      selectOpMachineYear: 'Select at least one operation, a target machine, and a year.',
       customCycleRequired: 'Enter a positive cycle time [s] under “New cycle time” or choose another option.',
       noAltCycle: 'This operation has no alternative cycle time defined.',
     },

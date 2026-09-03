@@ -155,7 +155,7 @@ export function parseSapRoutingBuffer(buffer: Buffer): SapRoutingIndex {
   return parseSapRoutingText(text);
 }
 
-/** Komponenty o danym kodzie (prefiks, np. S2102) dla wyrobu. */
+/** Komponenty o danym kodzie (prefiks, np. S2102) — tylko bezpośrednie dzieci Material. */
 export function componentsWithCode(
   index: SapRoutingIndex,
   finishedGoodSap: string,
@@ -165,6 +165,48 @@ export function componentsWithCode(
   const list = index.byFinishedGood.get(fg) ?? [];
   const prefix = codePrefix.trim().toUpperCase();
   return list.filter((c) => c.code === prefix || c.code.startsWith(prefix));
+}
+
+/**
+ * Komponenty o danym kodzie z wielopoziomowego BOM (BFS po Mat. Comp. → ich bloki Material).
+ * Np. FG → półprodukt → S2102 / S1619 na niższym poziomie.
+ */
+export function componentsWithCodeDeep(
+  index: SapRoutingIndex,
+  finishedGoodSap: string,
+  codePrefix: string,
+  maxDepth = 8
+): SapRoutingComponent[] {
+  const root = normSap(finishedGoodSap);
+  if (!root) return [];
+  const prefix = codePrefix.trim().toUpperCase();
+  if (!prefix) return [];
+
+  const found: SapRoutingComponent[] = [];
+  const foundKeys = new Set<string>();
+  const visited = new Set<string>([root]);
+  const queue: { sap: string; depth: number }[] = [{ sap: root, depth: 0 }];
+
+  while (queue.length) {
+    const { sap, depth } = queue.shift()!;
+    const list = index.byFinishedGood.get(sap) ?? [];
+    for (const c of list) {
+      if (c.code === prefix || c.code.startsWith(prefix)) {
+        const key = `${c.materialNumber}|${c.code}`;
+        if (!foundKeys.has(key)) {
+          foundKeys.add(key);
+          found.push(c);
+        }
+      }
+      if (depth + 1 >= maxDepth) continue;
+      const child = normSap(c.materialNumber);
+      if (!child || visited.has(child) || !index.byFinishedGood.has(child)) continue;
+      visited.add(child);
+      queue.push({ sap: child, depth: depth + 1 });
+    }
+  }
+
+  return found;
 }
 
 /**

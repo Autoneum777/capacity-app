@@ -1,4 +1,4 @@
-import { calendarWeekForMonthWeek, getWeekCountInMonth, weekOfMonthFromDate } from './calculatorPeriodExpansion';
+import { calendarWeekForMonthWeek, getWeekCountInMonth, assignIsoWeekToStartMonth } from './calculatorPeriodExpansion';
 
 export type DataVizRangeMode = 'year' | 'month' | 'week';
 
@@ -68,10 +68,7 @@ export function enumerateMonthsBetween(
 
 export function currentWeekAnchor(): WeekAnchor {
   const d = new Date();
-  const year = d.getFullYear();
-  const month = d.getMonth() + 1;
-  const day = d.getDate();
-  return { year, month, week: weekOfMonthFromDate(year, month, day) };
+  return assignIsoWeekToStartMonth(d.getFullYear(), d.getMonth() + 1, d.getDate());
 }
 
 export function parseWeekAnchorKey(key: string): WeekAnchor | null {

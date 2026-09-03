@@ -117,38 +117,75 @@ function unionClients(breakdown: BreakdownResponse): BreakdownClient[] {
   return [...byClient.values()].sort((a, b) => a.client.localeCompare(b.client));
 }
 
+function scaleLoadByShare(
+  periodAnchor: number | null | undefined,
+  sharePercent: number | null | undefined,
+  fallbackLoad?: number | null,
+  seriesLoadPercent?: number | null
+): number | null {
+  if (periodAnchor == null || !Number.isFinite(periodAnchor)) return null;
+  const share = Number(sharePercent);
+  if (Number.isFinite(share)) {
+    return Math.round(periodAnchor * (share / 100) * 100) / 100;
+  }
+  const nodeLoad = Number(fallbackLoad);
+  const seriesLoad = Number(seriesLoadPercent);
+  if (Number.isFinite(nodeLoad) && Number.isFinite(seriesLoad) && Math.abs(seriesLoad) > 1e-9) {
+    return Math.round(periodAnchor * (nodeLoad / seriesLoad) * 100) / 100;
+  }
+  return Number.isFinite(nodeLoad) ? nodeLoad : null;
+}
+
+function periodAnchorForSeries(yearTotals: SeriesValues, seriesKey: BreakdownSeriesKey): number | null {
+  if (seriesKey === 'production') return yearTotals.production;
+  if (seriesKey === 'contract') return yearTotals.contract;
+  if (seriesKey === 'scenario_production') return yearTotals.scenarioProduction;
+  if (seriesKey === 'scenario_contract') return yearTotals.scenarioContract;
+  return null;
+}
+
 function readSeriesLoad(
   breakdown: BreakdownResponse | null | undefined,
   seriesKey: BreakdownSeriesKey,
-  path: { client?: string; projectId?: number; detailLabel?: string }
+  path: { client?: string; projectId?: number; detailLabel?: string },
+  yearTotals: SeriesValues
 ): number | null {
   const series = breakdown?.series[seriesKey];
+  const periodAnchor = periodAnchorForSeries(yearTotals, seriesKey);
+  if (!path.client) return periodAnchor;
   if (!series) return null;
-  if (!path.client) return series.load_percent;
   const client = series.clients.find((c) => c.client === path.client);
   if (!client) return null;
-  if (path.projectId == null && !path.detailLabel) return client.load_percent ?? null;
+  if (path.projectId == null && !path.detailLabel) {
+    return scaleLoadByShare(periodAnchor, client.share_percent, client.load_percent, series.load_percent);
+  }
   const project = client.projects.find((p) => p.project_id === path.projectId);
   if (!project) return null;
-  if (!path.detailLabel) return project.load_percent ?? null;
+  if (!path.detailLabel) {
+    return scaleLoadByShare(periodAnchor, project.share_percent, project.load_percent, series.load_percent);
+  }
   const detail = project.details.find((d) => d.detail_label === path.detailLabel);
-  return detail?.load_percent ?? null;
+  if (!detail) return null;
+  return scaleLoadByShare(periodAnchor, detail.share_percent, detail.load_percent, series.load_percent);
 }
 
 function valuesFromBreakdown(
   breakdown: BreakdownResponse | null | undefined,
   path: { client?: string; projectId?: number; detailLabel?: string },
-  opts: TrendTableBuildOptions
+  opts: TrendTableBuildOptions,
+  yearTotals: SeriesValues
 ): SeriesValues {
   return {
-    production: opts.showProduction ? readSeriesLoad(breakdown, 'production', path) : null,
-    contract: opts.showContract ? readSeriesLoad(breakdown, 'contract', path) : null,
+    production: opts.showProduction ? readSeriesLoad(breakdown, 'production', path, yearTotals) : null,
+    contract: opts.showContract ? readSeriesLoad(breakdown, 'contract', path, yearTotals) : null,
     scenarioProduction:
       opts.hasScenario && opts.showScenarioProduction
-        ? readSeriesLoad(breakdown, 'scenario_production', path)
+        ? readSeriesLoad(breakdown, 'scenario_production', path, yearTotals)
         : null,
     scenarioContract:
-      opts.hasScenario && opts.showScenarioContract ? readSeriesLoad(breakdown, 'scenario_contract', path) : null,
+      opts.hasScenario && opts.showScenarioContract
+        ? readSeriesLoad(breakdown, 'scenario_contract', path, yearTotals)
+        : null,
   };
 }
 
@@ -217,13 +254,13 @@ function flattenYearBreakdown(
   const clients = unionClients(breakdown);
   for (const clientNode of clients) {
     if (detailLevel === 'client') {
-      const clientValues = valuesFromBreakdown(breakdown, { client: clientNode.client }, opts);
+      const clientValues = valuesFromBreakdown(breakdown, { client: clientNode.client }, opts, yearTotals);
       rows.push([...hierarchyCells(detailLevel, year, clientNode.client), ...valuesToCells(clientValues, opts)]);
       continue;
     }
 
     if (detailLevel === 'detail') {
-      const clientValues = valuesFromBreakdown(breakdown, { client: clientNode.client }, opts);
+      const clientValues = valuesFromBreakdown(breakdown, { client: clientNode.client }, opts, yearTotals);
       rows.push([
         ...hierarchyCells(detailLevel, year, clientNode.client, '', ''),
         ...valuesToCells(clientValues, opts),
@@ -235,7 +272,8 @@ function flattenYearBreakdown(
         const projectValues = valuesFromBreakdown(
           breakdown,
           { client: clientNode.client, projectId: projectNode.project_id },
-          opts
+          opts,
+          yearTotals
         );
         rows.push([
           ...hierarchyCells(detailLevel, year, clientNode.client, projectNode.project_name),
@@ -248,7 +286,8 @@ function flattenYearBreakdown(
         const projectValues = valuesFromBreakdown(
           breakdown,
           { client: clientNode.client, projectId: projectNode.project_id },
-          opts
+          opts,
+          yearTotals
         );
         rows.push([
           ...hierarchyCells(detailLevel, year, clientNode.client, projectNode.project_name, ''),
@@ -266,7 +305,8 @@ function flattenYearBreakdown(
             projectId: projectNode.project_id,
             detailLabel: detailNode.detail_label,
           },
-          opts
+          opts,
+          yearTotals
         );
         rows.push([
           ...hierarchyCells(detailLevel, year, clientNode.client, projectNode.project_name, detailNode.detail_label),

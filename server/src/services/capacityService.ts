@@ -832,6 +832,46 @@ export function invalidateAllocationSplitIndex(): void {
   allocationShareCache = new WeakMap();
 }
 
+function buildAllocationSplitIndexFromOperations(ops: { id?: number; operation_id?: number; split_from_operation_id?: number | null }[]): {
+  parentById: Map<number, number | null>;
+  childrenByParent: Map<number, number[]>;
+} {
+  const parentById = new Map<number, number | null>();
+  const childrenByParent = new Map<number, number[]>();
+  for (const op of ops) {
+    const id = Number(op.operation_id ?? op.id);
+    if (!Number.isFinite(id) || id <= 0) continue;
+    const parent =
+      op.split_from_operation_id != null && Number.isFinite(Number(op.split_from_operation_id))
+        ? Number(op.split_from_operation_id)
+        : null;
+    parentById.set(id, parent);
+    if (parent != null) {
+      const list = childrenByParent.get(parent);
+      if (list) list.push(id);
+      else childrenByParent.set(parent, [id]);
+    }
+  }
+  return { parentById, childrenByParent };
+}
+
+/** Ops (np. snapshot scenariusza) nadpisują indeks z bazy produkcyjnej. */
+function mergeAllocationSplitIndexes(
+  primary: { parentById: Map<number, number | null>; childrenByParent: Map<number, number[]> },
+  fallback: { parentById: Map<number, number | null>; childrenByParent: Map<number, number[]> }
+): { parentById: Map<number, number | null>; childrenByParent: Map<number, number[]> } {
+  const parentById = new Map(fallback.parentById);
+  for (const [id, parent] of primary.parentById) parentById.set(id, parent);
+  const childrenByParent = new Map<number, number[]>();
+  for (const [id, parent] of parentById) {
+    if (parent == null) continue;
+    const list = childrenByParent.get(parent);
+    if (list) list.push(id);
+    else childrenByParent.set(parent, [id]);
+  }
+  return { parentById, childrenByParent };
+}
+
 function ensureAllocationSplitIndex(): {
   parentById: Map<number, number | null>;
   childrenByParent: Map<number, number[]>;
@@ -923,16 +963,18 @@ function settingsCacheKey(settings: WorkingDaysRow): string {
 
 /**
  * Buduje mapę udziałów alokacji wyłącznie z volumeMap + indeksu split (bez zapytań per operacja).
+ * @param splitIndex — opcjonalnie ze snapshotu scenariusza / listy ops (nadpisuje samą bazę produkcyjną).
  */
 function buildAllocationFamilyShareMap(
   volumeMap: Map<number, OperationYearVolumeRow>,
   year: number,
   settings: WorkingDaysRow,
   activeMonth?: number,
-  activeWeek?: number
+  activeWeek?: number,
+  splitIndex?: { parentById: Map<number, number | null>; childrenByParent: Map<number, number[]> }
 ): Map<number, number> {
   const shares = new Map<number, number>();
-  const { parentById, childrenByParent } = ensureAllocationSplitIndex();
+  const { parentById, childrenByParent } = splitIndex ?? ensureAllocationSplitIndex();
 
   const weeklyOf = (row: OperationYearVolumeRow | null | undefined): number => {
     if (!row) return 0;
@@ -959,7 +1001,9 @@ function buildAllocationFamilyShareMap(
     }
     if (totalWeekly <= 1e-9) continue;
     for (const [fid, w] of weeklies) {
-      if (w > 1e-9) shares.set(fid, w / totalWeekly);
+      // Jawne 0 dla członków bez wolumenu — inaczej Call offs traktuje brak wpisu
+      // jako „brak udziału” i w fallbacku znów przypisuje 100% SAP na maszynę źródłową.
+      shares.set(fid, w / totalWeekly);
     }
   }
   return shares;
@@ -1339,6 +1383,16 @@ function callOffQuantityForPeriod(
   return callOffVolumes.annual.get(partId)?.get(year) ?? 0;
 }
 
+/** Call offs: nadpisanie z ilością SAP > 0 → licz mimo braku prod/kontrakt i poza SOP–EOP. */
+function isCallOffSapVolumeOverride(
+  callOffVolumes: CallOffVolumeMaps | null | undefined,
+  opVolumeOverride: OperationYearVolumeRow | null | undefined
+): boolean {
+  if (!callOffVolumes || !opVolumeOverride) return false;
+  if (String(opVolumeOverride.source ?? '').trim().toLowerCase() !== 'call_off') return false;
+  return Number(opVolumeOverride.volume_value) > 1e-9;
+}
+
 function callOffVolumeUnitForPeriod(
   activeMonth: number | undefined,
   activeWeek: number | undefined
@@ -1363,8 +1417,20 @@ function buildCallOffOperationShares(
 ): Map<number, number> {
   const callOffOpShare = new Map<number, number>();
 
-  // 1) Szybko: udziały z nadpisań alokacji (volumeMap), bez resolve per operacja.
-  const familyShares = buildAllocationFamilyShareMap(volumeMap, year, settings, activeMonth, activeWeek);
+  // 1) Udziały z nadpisań alokacji — indeks split ze snapshotu/ops + baza produkcyjna.
+  //    Samo DB nie widzi alokacji zrobionych tylko w scenariuszu → obie maszyny dostawały 100% SAP.
+  const splitIndex = mergeAllocationSplitIndexes(
+    buildAllocationSplitIndexFromOperations(allOps),
+    ensureAllocationSplitIndex()
+  );
+  const familyShares = buildAllocationFamilyShareMap(
+    volumeMap,
+    year,
+    settings,
+    activeMonth,
+    activeWeek,
+    splitIndex
+  );
   for (const [opId, share] of familyShares) {
     callOffOpShare.set(opId, share);
   }
@@ -1377,6 +1443,8 @@ function buildCallOffOperationShares(
 
   const familyKeyOf = (op: any, opKey: number) =>
     allocationFamilyRootId(opKey, op.split_from_operation_id, opById);
+
+  const hasAssignedShare = (opKey: number) => callOffOpShare.has(opKey);
 
   const weeklyFromResolved = (op: any, opKey: number, useContractForShare: boolean): number => {
     const resolved = resolveOperationVolumeForYear(
@@ -1428,7 +1496,7 @@ function buildCallOffOperationShares(
     for (const op of allOps) {
       const opKey = Number(op.operation_id ?? op.id);
       if (!Number.isFinite(opKey)) continue;
-      if ((callOffOpShare.get(opKey) ?? 0) > 0) continue;
+      if (hasAssignedShare(opKey)) continue;
 
       const weekly = weeklyFromResolved(op, opKey, useContractForShare);
       if (weekly <= 1e-9) continue;
@@ -1441,7 +1509,7 @@ function buildCallOffOperationShares(
     }
 
     for (const [opKey, weekly] of opWeekly) {
-      if ((callOffOpShare.get(opKey) ?? 0) > 0) continue;
+      if (hasAssignedShare(opKey)) continue;
       const family = opFamily.get(opKey);
       if (family == null) continue;
       const total = familyWeeklyTotal.get(family) ?? weekly;
@@ -1457,7 +1525,7 @@ function buildCallOffOperationShares(
   for (const op of allOps) {
     const opKey = Number(op.operation_id ?? op.id);
     if (!Number.isFinite(opKey)) continue;
-    if ((callOffOpShare.get(opKey) ?? 0) > 0) continue;
+    if (hasAssignedShare(opKey)) continue;
     const partId = op.part_id != null ? Number(op.part_id) : null;
     if (partId == null || !Number.isFinite(partId)) continue;
 
@@ -1483,19 +1551,8 @@ function buildCallOffOperationShares(
       volumeMap,
       false
     );
-    if (
-      !shouldIncludeOperationInCapacity(
-        op.sop ?? '',
-        op.eop ?? '',
-        year,
-        activeMonth ?? undefined,
-        Boolean(resolved.count_after_eop),
-        op.project_id != null
-      )
-    ) {
-      continue;
-    }
-    if (!isOperationAssignedOnMachineForPeriod(op, year, activeMonth, resolved)) continue;
+    // SAP w pliku + operacja w systemie: licz mimo braku prod/kontrakt i poza SOP–EOP projektu.
+    if (op.split_from_operation_id != null && !(resolved.volume_value > 1e-9)) continue;
 
     const family = familyKeyOf(op, opKey);
     if (!opsByFamilyWithoutShare.has(family)) opsByFamilyWithoutShare.set(family, []);
@@ -1674,6 +1731,7 @@ export function getMachineCapacitiesForYear(
           continue;
         }
       }
+      const callOffSapActive = isCallOffSapVolumeOverride(callOffVolumes, opVolumeOverride);
       const resolved = resolveOperationVolumeForYear(
         {
           operation_id: opKey,
@@ -1693,6 +1751,7 @@ export function getMachineCapacitiesForYear(
         callOffVolumes ? null : volumeMap
       );
       if (
+        !callOffSapActive &&
         !shouldIncludeOperationInCapacity(
           op.sop ?? '',
           op.eop ?? '',
@@ -1711,7 +1770,8 @@ export function getMachineCapacitiesForYear(
         eop: op.eop ?? '',
         year,
         volume_origin: resolved.volume_origin,
-        count_after_eop: resolved.count_after_eop,
+        // Call offs: ilość z pliku SAP obowiązuje w okresie pliku — bez zerowania przez SOP–EOP.
+        count_after_eop: callOffSapActive ? true : resolved.count_after_eop,
         has_project: op.project_id != null,
       });
       let weeklyVol = weeklyResolved.weekly;
@@ -1727,7 +1787,11 @@ export function getMachineCapacitiesForYear(
         if (usesAlternativeInCalculator) altBorderUsed++;
         else altBorderUnused++;
       }
-      if (requiredSecOp > 1e-9 || (includeAssignedZeroVolumeDetails && isOperationAssignedOnMachineForPeriod(op, year, activeMonth, resolved))) {
+      if (
+        requiredSecOp > 1e-9 ||
+        callOffSapActive ||
+        (includeAssignedZeroVolumeDetails && isOperationAssignedOnMachineForPeriod(op, year, activeMonth, resolved))
+      ) {
         const detailLabel = formatDetailSapAliasLabel(
           {
             sap_number: op.detail_sap_number,
@@ -1802,8 +1866,7 @@ export function getMachineCapacitiesForYear(
         const volume_quantity = Math.round(volumeQuantity * 100) / 100;
         return { project_label, detail_label, contribution_percent, share_percent, volume_quantity, has_rfq: hasRfq };
       })
-      .sort((a, b) => b.contribution_percent - a.contribution_percent)
-      .slice(0, 12);
+      .sort((a, b) => b.contribution_percent - a.contribution_percent);
 
     return {
       machine_id: m.machine_id,
@@ -2364,6 +2427,31 @@ type MonthPeakDetail = {
 }[];
 
 /**
+ * Rozkład detali do tooltipa przy średniej obciążenia:
+ * wybierz okres najbliższy targetLoad, ale preferuj okresy z niepustym breakdown
+ * (inaczej „najbliższy” często jest 0% bez detali przy średniej np. 25–60%).
+ */
+function pickDetailBreakdownClosestToLoad(
+  candidates: { load_percent: number; detail_breakdown: MonthPeakDetail }[],
+  targetLoad: number
+): MonthPeakDetail {
+  if (candidates.length === 0) return [];
+  const withDetails = candidates.filter((c) => (c.detail_breakdown?.length ?? 0) > 0);
+  const pool = withDetails.length > 0 ? withDetails : candidates;
+  let best = pool[0]!;
+  let bestDist = Math.abs(Number(best.load_percent) - targetLoad);
+  for (let i = 1; i < pool.length; i++) {
+    const c = pool[i]!;
+    const dist = Math.abs(Number(c.load_percent) - targetLoad);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = c;
+    }
+  }
+  return best.detail_breakdown ?? [];
+}
+
+/**
  * Obciążenie miesięczne (1–12) dla wszystkich maszyn.
  * Produkcja / scenariusz: obciążenie z wolumenu miesięcznego (rok = średnia 12 miesięcy).
  * Call offs: miesiąc = średnia tygodni w zakresie danych SAP (zera w zakresie liczą się).
@@ -2429,18 +2517,17 @@ export function getMachineMonthlyLoadsByMonth(
         for (const [machineId, bucket] of weekLoads) {
           if (!byMachine.has(machineId)) byMachine.set(machineId, new Map());
           const avg = averageLoadPercent(bucket.loads);
-          let bestDetail: MonthPeakDetail = bucket.details[0] ?? [];
-          let bestDist = Number.POSITIVE_INFINITY;
-          for (let i = 0; i < bucket.loads.length; i++) {
-            const dist = Math.abs(bucket.loads[i]! - avg);
-            if (dist < bestDist) {
-              bestDist = dist;
-              bestDetail = bucket.details[i] ?? [];
-            }
-          }
+          const bestDetail = pickDetailBreakdownClosestToLoad(
+            bucket.loads.map((load_percent, i) => ({
+              load_percent,
+              detail_breakdown: bucket.details[i] ?? [],
+            })),
+            avg
+          );
+          const ww = Math.max(1, shared.settingsByYear.get(year)?.working_weeks_per_year ?? 48);
           byMachine.get(machineId)!.set(month, {
             load_percent: avg,
-            detail_breakdown: bestDetail,
+            detail_breakdown: convertBreakdownVolumesWeeklyToMonthly(bestDetail, ww),
           });
         }
         continue;
@@ -2518,21 +2605,17 @@ export function getMachineMonthlyAverageLoads(
   }
   for (const [machineId, months] of byMonth) {
     const vals: number[] = [];
-    let bestDetail: MonthPeakDetail = [];
-    let bestDist = Number.POSITIVE_INFINITY;
+    const monthCandidates: { load_percent: number; detail_breakdown: MonthPeakDetail }[] = [];
     for (let m = monthFrom; m <= monthTo; m++) {
       const md = months.get(m) ?? { load_percent: 0, detail_breakdown: [] as MonthPeakDetail };
       vals.push(md.load_percent);
+      monthCandidates.push({
+        load_percent: md.load_percent,
+        detail_breakdown: md.detail_breakdown ?? [],
+      });
     }
     const avg = averageLoadPercent(vals);
-    for (let m = monthFrom; m <= monthTo; m++) {
-      const md = months.get(m) ?? { load_percent: 0, detail_breakdown: [] as MonthPeakDetail };
-      const dist = Math.abs(md.load_percent - avg);
-      if (dist < bestDist) {
-        bestDist = dist;
-        bestDetail = md.detail_breakdown ?? [];
-      }
-    }
+    const bestDetail = pickDetailBreakdownClosestToLoad(monthCandidates, avg);
     averages.set(machineId, { load_percent: avg, detail_breakdown: bestDetail });
   }
   // Maszyny bez wpisu w byMonth (brak load w zakresie) — 0%.
@@ -2762,24 +2845,17 @@ export function getMachinePeriodBreakdown(
             details.push((wd?.detail_breakdown ?? []) as MonthPeakDetail);
           }
           monthLoad = averageLoadPercent(vals);
-          let bestDetail: MonthPeakDetail = details[0] ?? [];
-          let bestDist = Number.POSITIVE_INFINITY;
-          for (let i = 0; i < vals.length; i++) {
-            const dist = Math.abs(vals[i]! - monthLoad);
-            if (dist < bestDist) {
-              bestDist = dist;
-              bestDetail = details[i] ?? [];
-            }
-          }
+          let bestDetail = pickDetailBreakdownClosestToLoad(
+            vals.map((load_percent, i) => ({
+              load_percent,
+              detail_breakdown: details[i] ?? [],
+            })),
+            monthLoad
+          );
           // Obciążenie miesiąca = średnia tygodni; skład z tygodnia najbliższego średniej.
-          // Call offs: klient etykietuje miesiąc jako szt./tydz. — zostaw ilości tygodniowe.
-          // Produkcja: tooltip miesiąca to szt./mies. — przelicz z tygodniowych.
-          if (callOffVolumes) {
-            monthDetail = bestDetail;
-          } else {
-            const ww = Math.max(1, shared.settingsByYear.get(year)?.working_weeks_per_year ?? 48);
-            monthDetail = convertBreakdownVolumesWeeklyToMonthly(bestDetail, ww);
-          }
+          // Tooltip miesiąca: szt./mies. — przelicz ilości z tygodniowych (produkcja i Call offs).
+          const ww = Math.max(1, shared.settingsByYear.get(year)?.working_weeks_per_year ?? 48);
+          monthDetail = convertBreakdownVolumesWeeklyToMonthly(bestDetail, ww);
         }
       }
       months[month] = {
@@ -3091,6 +3167,7 @@ function accumulateScopeBreakdown(
         source: 'call_off',
       };
     }
+    const callOffSapActive = isCallOffSapVolumeOverride(opts.callOffVolumes, opVolumeOverride);
     const resolved = resolveOperationVolumeForYear(
       {
         operation_id: opKey,
@@ -3110,6 +3187,7 @@ function accumulateScopeBreakdown(
       opts.callOffVolumes ? null : volumeMap
     );
     if (
+      !callOffSapActive &&
       !shouldIncludeOperationInCapacity(
         op.sop ?? '',
         op.eop ?? '',
@@ -3128,7 +3206,7 @@ function accumulateScopeBreakdown(
       eop: op.eop ?? '',
       year,
       volume_origin: resolved.volume_origin,
-      count_after_eop: resolved.count_after_eop,
+      count_after_eop: callOffSapActive ? true : resolved.count_after_eop,
       has_project: op.project_id != null,
     });
     const weeklyVol = weeklyResolved.weekly;

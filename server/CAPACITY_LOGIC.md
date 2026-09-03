@@ -95,6 +95,8 @@ W Call offs: zera **wewnątrz** zakresu SAP liczą się do średniej; zera **poz
 
 Zakres dat / miesięcy z wolumenem w pliku ogranicza, które okresy wchodzą do średniej Call offs (oraz które lata mają punkty na wykresach).
 
+Gdy detal jest w systemie, ma operację na maszynie i w pliku SAP jest ilość > 0 w okresie, wolumen Call offs jest liczony **nawet bez** wolumenów produkcyjnych/kontraktowych oraz **nawet gdy** SOP/EOP projektu nie obejmuje tego roku (okres bierze się z pliku SAP).
+
 ## Uwagi operacyjne
 
 - Profile **Capacity** i **OCU** mają osobne tabele dni roboczych; scenariusze zawsze liczą profilem Capacity.

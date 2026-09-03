@@ -9,13 +9,28 @@ import {
 } from '../utils/zipEntryRewrite.js';
 import {
   baseQtyForMaterial,
-  componentsWithCode,
+  componentsWithCodeDeep,
   materialCellValue,
   parseSapRoutingBuffer,
   splitS2102ByFormatka,
   type SapRoutingComponent,
   type SapRoutingIndex,
 } from './sapRoutingParser.js';
+import { readWorkbookBufferWithOptionalPassword } from '../utils/excelPasswordUnlock.js';
+import {
+  applyHeaderHintsToColumnLetters,
+  DEFAULT_OCU_COLUMN_LETTERS,
+  excelLetterFromColIndex0,
+  mergeOcuColumnLetters,
+  type OcuColumnLetters,
+} from './ocuColumnMapping.js';
+
+export type { OcuColumnLetters } from './ocuColumnMapping.js';
+export {
+  DEFAULT_OCU_COLUMN_LETTERS,
+  OCU_COLUMN_FIELD_META,
+  shiftOcuColumnsAfterLetter,
+} from './ocuColumnMapping.js';
 
 /** Excel 1-based letters → 0-based index. */
 export function excelColIndex(letter: string): number {
@@ -33,17 +48,6 @@ export function excelColIndex(letter: string): number {
 function excelCol1(letter: string): number {
   return excelColIndex(letter) + 1;
 }
-
-/** Arkusz Input: A=ID, …, E=Date Year, S=Sonar Part Code, X/AB/AC/AD/AE = Opt1cxx_*. */
-const INPUT_FALLBACK = {
-  year: excelCol1('E'),
-  sonarCode: excelCol1('S'),
-  x: excelCol1('X'),
-  ab: excelCol1('AB'),
-  ac: excelCol1('AC'),
-  ad: excelCol1('AD'),
-  ae: excelCol1('AE'),
-} as const;
 
 const TRANSITION = {
   sonar: excelColIndex('B'),
@@ -137,37 +141,52 @@ function escapeXml(text: string): string {
     .replace(/"/g, '&quot;');
 }
 
-function resolveInputColumns(headerRow: unknown[]): InputColMap {
-  let sonar = INPUT_FALLBACK.sonarCode;
-  let year = INPUT_FALLBACK.year;
+function inputColsFromLetters(letters: OcuColumnLetters): InputColMap {
+  return {
+    year: excelCol1(letters.year),
+    sonarCode: excelCol1(letters.sonarCode),
+    x: excelCol1(letters.x),
+    ab: excelCol1(letters.ab),
+    ac: excelCol1(letters.ac),
+    ad: excelCol1(letters.ad),
+    ae: excelCol1(letters.ae),
+  };
+}
+
+/**
+ * Buduje mapę kolumn capacity z liter użytkownika.
+ * Gdy `preferHeaderDetect` i brak jawnego override — Sonar/Year z nagłówków.
+ */
+function resolveInputColumns(
+  headerRow: unknown[],
+  letters: OcuColumnLetters,
+  options?: { preferHeaderDetect?: boolean }
+): InputColMap {
+  const cols = inputColsFromLetters(letters);
+  if (!options?.preferHeaderDetect) return cols;
+
+  // Auto-detect tylko gdy litery odczytu = domyślne (użytkownik jeszcze nie przesunął).
+  const defaults = DEFAULT_OCU_COLUMN_LETTERS;
+  const yearIsDefault = letters.year.toUpperCase() === defaults.year;
+  const sonarIsDefault = letters.sonarCode.toUpperCase() === defaults.sonarCode;
+  if (!yearIsDefault && !sonarIsDefault) return cols;
+
   for (let i = 0; i < headerRow.length; i++) {
     const h = String(headerRow[i] ?? '')
       .trim()
       .toLowerCase();
     if (!h) continue;
-    if (h === 'sonar part code' || h.includes('sonar part code')) sonar = i + 1;
-    if (h === 'date year' || h.includes('date year')) year = i + 1;
+    if (sonarIsDefault && (h === 'sonar part code' || h.includes('sonar part code'))) {
+      cols.sonarCode = i + 1;
+    }
+    if (yearIsDefault && (h === 'date year' || h.includes('date year'))) {
+      cols.year = i + 1;
+    }
   }
-  return {
-    year,
-    sonarCode: sonar,
-    x: INPUT_FALLBACK.x,
-    ab: INPUT_FALLBACK.ab,
-    ac: INPUT_FALLBACK.ac,
-    ad: INPUT_FALLBACK.ad,
-    ae: INPUT_FALLBACK.ae,
-  };
+  return cols;
 }
 
-function findInputSheetMatrix(buffer: Buffer): { rows: unknown[][]; headerRowNum: number; cols: InputColMap } {
-  const wb = XLSX.read(buffer, { type: 'buffer', sheets: ['Input'], cellDates: true });
-  const sheet = wb.Sheets['Input'];
-  if (!sheet) throw new Error('Katowice_Data: nie znaleziono arkusza „Input”.');
-  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null }) as unknown[][];
-  if (!rows.length) throw new Error('Katowice_Data / Input: pusty arkusz.');
-
-  let headerRowNum = 0;
-  let cols: InputColMap | null = null;
+function findInputHeaderRow(rows: unknown[][]): { headerRowNum: number; header: unknown[] } {
   const maxScan = Math.min(25, rows.length);
   for (let i = 0; i < maxScan; i++) {
     const header = rows[i] ?? [];
@@ -177,14 +196,115 @@ function findInputSheetMatrix(buffer: Buffer): { rows: unknown[][]; headerRowNum
         .includes('sonar part code')
     );
     if (!hasSonar) continue;
-    headerRowNum = i + 1; // 1-based Excel
-    cols = resolveInputColumns(header);
-    break;
+    return { headerRowNum: i + 1, header };
   }
-  if (!cols || !headerRowNum) {
-    throw new Error('Katowice_Data / Input: nie znaleziono wiersza nagłówka (Sonar Part Code).');
+  throw new Error('Katowice_Data / Input: nie znaleziono wiersza nagłówka (Sonar Part Code).');
+}
+
+function findInputSheetMatrix(
+  buffer: Buffer,
+  letters: OcuColumnLetters
+): { rows: unknown[][]; headerRowNum: number; cols: InputColMap; header: unknown[] } {
+  const wb = XLSX.read(buffer, { type: 'buffer', sheets: ['Input'], cellDates: true });
+  const sheet = wb.Sheets['Input'];
+  if (!sheet) throw new Error('Katowice_Data: nie znaleziono arkusza „Input”.');
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null }) as unknown[][];
+  if (!rows.length) throw new Error('Katowice_Data / Input: pusty arkusz.');
+
+  const { headerRowNum, header } = findInputHeaderRow(rows);
+  const cols = resolveInputColumns(header, letters, { preferHeaderDetect: true });
+  return { rows, headerRowNum, cols, header };
+}
+
+/** Blok Opt1bxx / Opt2bxx (S2102) — litery z mapowania (domyślnie CR–DC / DD–DO). */
+type S2102BlockCols = {
+  machineGroup: string;
+  costCenter: string;
+  capacity: string;
+  oeeActual: string;
+  oeeTarget: string;
+  erpNo: string;
+  cavities: string;
+  unitPerHour: string;
+  lanes: string;
+  moulded: string;
+  length: string;
+  width: string;
+};
+
+function buildS2102BlocksFromLetters(letters: OcuColumnLetters): {
+  large: S2102BlockCols;
+  small: S2102BlockCols;
+} {
+  return {
+    large: {
+      machineGroup: letters.s2102LargeMachineGroup,
+      costCenter: letters.s2102LargeCostCenter,
+      capacity: letters.s2102LargeCapacity,
+      oeeActual: letters.s2102LargeOeeActual,
+      oeeTarget: letters.s2102LargeOeeTarget,
+      erpNo: letters.s2102LargeErpNo,
+      cavities: letters.s2102LargeCavities,
+      unitPerHour: letters.s2102LargeUnitPerHour,
+      lanes: letters.s2102LargeLanes,
+      moulded: letters.s2102LargeMoulded,
+      length: letters.s2102LargeLength,
+      width: letters.s2102LargeWidth,
+    },
+    small: {
+      machineGroup: letters.s2102SmallMachineGroup,
+      costCenter: letters.s2102SmallCostCenter,
+      capacity: letters.s2102SmallCapacity,
+      oeeActual: letters.s2102SmallOeeActual,
+      oeeTarget: letters.s2102SmallOeeTarget,
+      erpNo: letters.s2102SmallErpNo,
+      cavities: letters.s2102SmallCavities,
+      unitPerHour: letters.s2102SmallUnitPerHour,
+      lanes: letters.s2102SmallLanes,
+      moulded: letters.s2102SmallMoulded,
+      length: letters.s2102SmallLength,
+      width: letters.s2102SmallWidth,
+    },
+  };
+}
+
+export type OcuInputHeaderPreview = {
+  headerRowNum: number;
+  headers: { letter: string; header: string; col1: number }[];
+  suggested: OcuColumnLetters;
+};
+
+/** Podgląd nagłówków arkusza Input — do mapowania kolumn w UI. */
+export async function previewKatowiceInputHeaders(
+  katowiceBuffer: Buffer,
+  options?: { katowicePassword?: string | null; columnMapping?: Partial<OcuColumnLetters> | null }
+): Promise<OcuInputHeaderPreview> {
+  const katowiceUnlocked = await readWorkbookBufferWithOptionalPassword(
+    katowiceBuffer,
+    options?.katowicePassword,
+    'Katowice_Data'
+  );
+  const wb = XLSX.read(katowiceUnlocked, { type: 'buffer', sheets: ['Input'], cellDates: true });
+  const sheet = wb.Sheets['Input'];
+  if (!sheet) throw new Error('Katowice_Data: nie znaleziono arkusza „Input”.');
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null }) as unknown[][];
+  if (!rows.length) throw new Error('Katowice_Data / Input: pusty arkusz.');
+
+  const { headerRowNum, header } = findInputHeaderRow(rows);
+  const headers: OcuInputHeaderPreview['headers'] = [];
+  for (let i = 0; i < header.length; i++) {
+    const text = String(header[i] ?? '').trim();
+    if (!text) continue;
+    headers.push({
+      letter: excelLetterFromColIndex0(i),
+      header: text,
+      col1: i + 1,
+    });
   }
-  return { rows, headerRowNum, cols };
+
+  const base = mergeOcuColumnLetters(options?.columnMapping);
+  const suggested = applyHeaderHintsToColumnLetters(headers, base);
+  return { headerRowNum, headers, suggested };
 }
 
 type DbDetailProfile = {
@@ -376,28 +496,105 @@ function loadDetailProfilesBySap(yearsNeeded: number[]): Map<string, DbDetailPro
   return map;
 }
 
-function pickLineForYear(profile: DbDetailProfile | undefined, year: number | null): string | null {
-  if (!profile || year == null) return null;
-  const byLine = profile.lineWeightByYear.get(year);
-  if (!byLine || byLine.size === 0) {
-    // fallback: dowolna linia z dowolnego roku (największa waga łącznie)
-    const totals = new Map<string, number>();
-    for (const m of profile.lineWeightByYear.values()) {
-      for (const [line, w] of m) totals.set(line, (totals.get(line) ?? 0) + w);
-    }
-    let best: string | null = null;
-    let bestW = -1;
-    for (const [line, w] of totals) {
-      if (w > bestW) {
-        bestW = w;
-        best = line;
+/**
+ * Ostatnie 2 cyfry SAP = rewizja detalu.
+ * Stem (bez rewizji) — dopasowanie operacji w Capacity, gdy dokładny ERP z Tabeli przejścia
+ * nie ma operacji / nie istnieje w bazie.
+ */
+function sapRevisionStem(sap: string): string | null {
+  const s = normSapKey(sap);
+  if (s.length < 4 || !/\d{2}$/.test(s)) return null;
+  return s.slice(0, -2);
+}
+
+function profileOperationScore(p: DbDetailProfile): number {
+  let score = 0;
+  if (p.lineWeightByYear.size > 0) score += 1000;
+  if (p.nestsParts.length > 0) score += 50;
+  if (p.maxCycleSeconds != null && p.maxCycleSeconds > 0) score += 20;
+  for (const byLine of p.lineWeightByYear.values()) {
+    for (const w of byLine.values()) score += Math.min(Number(w) || 0, 100);
+  }
+  return score;
+}
+
+function profileHasDescribedOperation(p: DbDetailProfile | undefined): boolean {
+  if (!p) return false;
+  return (
+    p.lineWeightByYear.size > 0 ||
+    p.nestsParts.length > 0 ||
+    (p.maxCycleSeconds != null && p.maxCycleSeconds > 0)
+  );
+}
+
+/**
+ * Profil Capacity dla ERP z przejścia: najpierw dokładny numer,
+ * potem inna rewizja (te same cyfry poza ostatnimi dwoma) z opisanymi operacjami.
+ */
+function resolveDetailProfileByErp(
+  profiles: Map<string, DbDetailProfile>,
+  erp: string
+): { profile: DbDetailProfile; matchedSap: string } | null {
+  const key = normSapKey(erp);
+  if (!key) return null;
+
+  const exact = profiles.get(key);
+  if (exact && profileHasDescribedOperation(exact)) {
+    return { profile: exact, matchedSap: key };
+  }
+
+  const stem = sapRevisionStem(key);
+  if (stem) {
+    let bestSap: string | null = null;
+    let best: DbDetailProfile | null = null;
+    let bestScore = 0;
+    let bestRevDist = Number.POSITIVE_INFINITY;
+    const wantRev = Number(key.slice(-2));
+
+    for (const [sap, p] of profiles) {
+      if (sap === key) continue;
+      if (sapRevisionStem(sap) !== stem) continue;
+      if (!profileHasDescribedOperation(p)) continue;
+      const score = profileOperationScore(p);
+      const rev = Number(sap.slice(-2));
+      const revDist = Number.isFinite(wantRev) && Number.isFinite(rev) ? Math.abs(wantRev - rev) : 999;
+      if (
+        score > bestScore ||
+        (score === bestScore && revDist < bestRevDist) ||
+        (score === bestScore && revDist === bestRevDist && (bestSap == null || sap < bestSap))
+      ) {
+        bestScore = score;
+        bestRevDist = revDist;
+        best = p;
+        bestSap = sap;
       }
     }
-    return best;
+    if (best && bestSap) return { profile: best, matchedSap: bestSap };
   }
+
+  if (exact) return { profile: exact, matchedSap: key };
+  return null;
+}
+
+/** Linia 999 w Capacity = placeholder (np. maszyna pomocnicza HT) — nie używaj do kolumny X w OCU, gdy jest realna linia. */
+const OCU_PLACEHOLDER_LINE = '999';
+
+function isOcuPlaceholderLine(line: string): boolean {
+  return normKey(line) === OCU_PLACEHOLDER_LINE;
+}
+
+function pickBestLineFromWeights(byLine: Map<string, number>): string | null {
+  const real = new Map<string, number>();
+  const placeholders = new Map<string, number>();
+  for (const [line, w] of byLine) {
+    if (w <= 0 || !line) continue;
+    if (isOcuPlaceholderLine(line)) placeholders.set(line, w);
+    else real.set(line, w);
+  }
+  const pool = real.size > 0 ? real : placeholders;
   let best: string | null = null;
   let bestW = -1;
-  for (const [line, w] of byLine) {
+  for (const [line, w] of pool) {
     if (w > bestW) {
       bestW = w;
       best = line;
@@ -406,47 +603,20 @@ function pickLineForYear(profile: DbDetailProfile | undefined, year: number | nu
   return best;
 }
 
-/**
- * Blok Opt1bxx / Opt2bxx (S2102) — pełny zakres CR–DC / DD–DO.
- * Przy braku S2102 w routingu czyścimy CAŁY blok (w tym Machinegroup „B03_Heavy Layer” / HL),
- * nie tylko ERP No — inaczej zostają stare opisy z szablonu.
- */
-const S2102_BLOCK_COLS = {
-  large: {
-    machineGroup: 'CR',
-    costCenter: 'CS',
-    capacity: 'CT',
-    oeeActual: 'CU',
-    oeeTarget: 'CV',
-    erpNo: 'CW',
-    cavities: 'CX',
-    unitPerHour: 'CY', // Base Qty
-    lanes: 'CZ',
-    moulded: 'DA',
-    length: 'DB',
-    width: 'DC',
-  },
-  small: {
-    machineGroup: 'DD',
-    costCenter: 'DE',
-    capacity: 'DF',
-    oeeActual: 'DG',
-    oeeTarget: 'DH',
-    erpNo: 'DI',
-    cavities: 'DJ',
-    unitPerHour: 'DK', // Base Qty
-    lanes: 'DL',
-    moulded: 'DM',
-    length: 'DN',
-    width: 'DO',
-  },
-} as const;
-
-type S2102BlockCols = (typeof S2102_BLOCK_COLS)[keyof typeof S2102_BLOCK_COLS];
-
-/** S1619 — numer materiału w AK; Machinegroup AF czyścimy przy braku dopasowania. */
-const S1619_ERP_COL = 'AK';
-const S1619_MACHINEGROUP_COL = 'AF';
+function pickLineForYear(profile: DbDetailProfile | undefined, year: number | null): string | null {
+  if (!profile || year == null) return null;
+  const byLine = profile.lineWeightByYear.get(year);
+  if (byLine && byLine.size > 0) {
+    const picked = pickBestLineFromWeights(byLine);
+    if (picked) return picked;
+  }
+  // fallback: dowolna linia z dowolnego roku (największa waga łącznie; 999 na końcu)
+  const totals = new Map<string, number>();
+  for (const m of profile.lineWeightByYear.values()) {
+    for (const [line, w] of m) totals.set(line, (totals.get(line) ?? 0) + w);
+  }
+  return pickBestLineFromWeights(totals);
+}
 
 /** Wartości „pustego” wiersza technologii — zawsze 0 (nie „-”). */
 function clearTechPlaceholder(cellUpdates: Map<string, string | number>, excelRow: number, col: string): void {
@@ -463,7 +633,8 @@ function writeRoutingErpNo(
   cellUpdates: Map<string, string | number>,
   excelRow: number,
   colLetter: string,
-  materials: { materialNumber: string }[]
+  materials: { materialNumber: string }[],
+  machineGroupCol: string
 ): number {
   const mat = materials[0];
   if (mat?.materialNumber) {
@@ -471,7 +642,7 @@ function writeRoutingErpNo(
     return 1;
   }
   cellUpdates.set(`${colLetter}${excelRow}`, 0);
-  clearTechPlaceholder(cellUpdates, excelRow, S1619_MACHINEGROUP_COL);
+  clearTechPlaceholder(cellUpdates, excelRow, machineGroupCol);
   return 0;
 }
 
@@ -652,8 +823,20 @@ const AUTO_FILTER_BLOCK =
   /<(?:[\w.-]+:)?autoFilter\b[^>]*\/>|<(?:[\w.-]+:)?autoFilter\b[^>]*>[\s\S]*?<\/(?:[\w.-]+:)?autoFilter>/gi;
 const SORT_STATE_BLOCK =
   /<(?:[\w.-]+:)?sortState\b[^>]*\/>|<(?:[\w.-]+:)?sortState\b[^>]*>[\s\S]*?<\/(?:[\w.-]+:)?sortState>/gi;
+const MERGE_CELLS_BLOCK =
+  /<(?:[\w.-]+:)?mergeCells\b[^>]*\/>|<(?:[\w.-]+:)?mergeCells\b[^>]*>[\s\S]*?<\/(?:[\w.-]+:)?mergeCells>/gi;
+const SHEET_PROTECTION_BLOCK =
+  /<(?:[\w.-]+:)?sheetProtection\b[^>]*\/>|<(?:[\w.-]+:)?sheetProtection\b[^>]*>[\s\S]*?<\/(?:[\w.-]+:)?sheetProtection>/gi;
+const TABLE_PARTS_BLOCK =
+  /<(?:[\w.-]+:)?tableParts\b[^>]*\/>|<(?:[\w.-]+:)?tableParts\b[^>]*>[\s\S]*?<\/(?:[\w.-]+:)?tableParts>/gi;
+const PROTECTED_RANGES_BLOCK =
+  /<(?:[\w.-]+:)?protectedRanges\b[^>]*\/>|<(?:[\w.-]+:)?protectedRanges\b[^>]*>[\s\S]*?<\/(?:[\w.-]+:)?protectedRanges>/gi;
+const WORKBOOK_PROTECTION_BLOCK =
+  /<(?:[\w.-]+:)?workbookProtection\b[^>]*\/>|<(?:[\w.-]+:)?workbookProtection\b[^>]*>[\s\S]*?<\/(?:[\w.-]+:)?workbookProtection>/gi;
+const FILE_SHARING_BLOCK =
+  /<(?:[\w.-]+:)?fileSharing\b[^>]*\/>|<(?:[\w.-]+:)?fileSharing\b[^>]*>[\s\S]*?<\/(?:[\w.-]+:)?fileSharing>/gi;
 
-/** Czyści kryteria filtrów (zostawia pusty autoFilter z atrybutami) i odkrywa ukryte wiersze. */
+/** Czyści filtry, ochronę, scalenia i tabele Excel — ułatwia kopiowanie kolumn w wygenerowanym pliku. */
 function clearFiltersAndUnhideInXml(xml: string, opts: { isTable?: boolean }): string {
   let out = xml;
   if (opts.isTable) {
@@ -669,11 +852,162 @@ function clearFiltersAndUnhideInXml(xml: string, opts: { isTable?: boolean }): s
 
   out = out.replace(AUTO_FILTER_BLOCK, '');
   out = out.replace(SORT_STATE_BLOCK, '');
+  out = out.replace(MERGE_CELLS_BLOCK, '');
+  out = out.replace(SHEET_PROTECTION_BLOCK, '');
+  out = out.replace(PROTECTED_RANGES_BLOCK, '');
+  out = out.replace(TABLE_PARTS_BLOCK, '');
   out = out.replace(/\sfilterMode="1"/gi, '');
   out = out.replace(/\sfilterMode='1'/gi, '');
   out = out.replace(/(<row\b[^>]*?)\s+hidden="1"/gi, '$1');
   out = out.replace(/(<row\b[^>]*?)\s+hidden='1'/gi, '$1');
   return out;
+}
+
+/** Usuwa ochronę struktury skoroszytu (blokuje m.in. dodawanie nowych zakładek). */
+function stripWorkbookStructureLocks(wbXml: string): string {
+  return wbXml.replace(WORKBOOK_PROTECTION_BLOCK, '').replace(FILE_SHARING_BLOCK, '');
+}
+
+/** Odblokowuje komórki w stylach (domyślnie locked=1 — razem z sheetProtection uniemożliwia edycję). */
+function unlockStylesXml(stylesXml: string): string {
+  return stylesXml.replace(/\blocked="1"/gi, ' locked="0"').replace(/\blocked='1'/gi, " locked='0'");
+}
+
+function stripMarkAsFinal(xml: string): string {
+  return xml
+    .replace(/<(?:[\w.-]+:)?MarkAsFinal\b[^>]*>[\s\S]*?<\/(?:[\w.-]+:)?MarkAsFinal>/gi, '')
+    .replace(/<(?:[\w.-]+:)?MarkAsFinal\b[^>]*\/>/gi, '');
+}
+
+/** Usuwa relacje do Excel Table z sheet.rels (kopiowanie kolumn nie działa na ListObject). */
+function stripTableRelationshipsFromSheetRels(relsXml: string): string {
+  return relsXml.replace(/<Relationship\b[^>]*\/?>/gi, (tag) => {
+    const type = tag.match(/\bType="([^"]+)"/i)?.[1] ?? tag.match(/\bType='([^']+)'/i)?.[1] ?? '';
+    const target = tag.match(/\bTarget="([^"]+)"/i)?.[1] ?? tag.match(/\bTarget='([^']+)'/i)?.[1] ?? '';
+    if (/\/table$/i.test(type) || /tables\//i.test(target)) return '';
+    return tag;
+  });
+}
+
+/**
+ * Usuwa wszystkie typowe blokady Excel z paczki OOXML:
+ * ochrona skoroszytu/arkusza, tabele, scalenia, Mark as Final, locked w stylach.
+ */
+function makeWorkbookFullyEditable(buffer: Buffer): Buffer {
+  const { entries } = readZipEntries(buffer);
+  const replacements = new Map<string, Buffer>();
+
+  for (const entry of entries) {
+    if (entry.name === 'xl/workbook.xml') {
+      const xml = inflateZipEntry(entry).toString('utf8');
+      const next = stripWorkbookStructureLocks(xml);
+      if (next !== xml) replacements.set(entry.name, Buffer.from(next, 'utf8'));
+      continue;
+    }
+    if (entry.name === 'xl/styles.xml') {
+      const xml = inflateZipEntry(entry).toString('utf8');
+      const next = unlockStylesXml(xml);
+      if (next !== xml) replacements.set(entry.name, Buffer.from(next, 'utf8'));
+      continue;
+    }
+    if (/^xl\/worksheets\/[^/]+\.xml$/i.test(entry.name)) {
+      const xml = inflateZipEntry(entry).toString('utf8');
+      const next = clearFiltersAndUnhideInXml(xml, { isTable: false });
+      if (next !== xml) replacements.set(entry.name, Buffer.from(next, 'utf8'));
+      continue;
+    }
+    if (/^xl\/worksheets\/_rels\/[^/]+\.rels$/i.test(entry.name)) {
+      const xml = inflateZipEntry(entry).toString('utf8');
+      const next = stripTableRelationshipsFromSheetRels(xml);
+      if (next !== xml) replacements.set(entry.name, Buffer.from(next, 'utf8'));
+      continue;
+    }
+    if (entry.name === '[Content_Types].xml') {
+      const xml = inflateZipEntry(entry).toString('utf8');
+      const next = xml
+        .replace(/<Override\b[^>]*PartName="\/xl\/tables\/[^"]+"[^>]*\/>/gi, '')
+        .replace(/<Override\b[^>]*PartName='\/xl\/tables\/[^']+'[^>]*\/>/gi, '');
+      if (next !== xml) replacements.set(entry.name, Buffer.from(next, 'utf8'));
+      continue;
+    }
+    if (/^docProps\//i.test(entry.name) && entry.name.endsWith('.xml')) {
+      const xml = inflateZipEntry(entry).toString('utf8');
+      const next = stripMarkAsFinal(xml);
+      if (next !== xml) replacements.set(entry.name, Buffer.from(next, 'utf8'));
+    }
+  }
+
+  return rewriteZipEntriesFiltered(buffer, replacements, (name) => !/^xl\/tables\//i.test(name));
+}
+
+/**
+ * Buduje nowy, prosty .xlsx z arkusza Input (same wartości, bez merge/tabel/ochrony/VBA).
+ * Patch OOXML szablonu Katowice nadal blokował kopiowanie („multiple selections”) i filtry.
+ */
+function rebuildPlainInputWorkbook(filledBuffer: Buffer): Buffer {
+  const wb = XLSX.read(filledBuffer, { type: 'buffer', cellDates: true });
+  const sheetName =
+    wb.SheetNames.find((n) => String(n).trim().toLowerCase() === 'input') ?? wb.SheetNames[0];
+  if (!sheetName) throw new Error('Katowice_Data_OCU: brak arkusza po wypełnieniu.');
+  const sheet = wb.Sheets[sheetName];
+  if (!sheet) throw new Error('Katowice_Data_OCU: pusty arkusz Input.');
+
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: true }) as unknown[][];
+  let lastRow = rows.length;
+  while (lastRow > 0) {
+    const r = rows[lastRow - 1] ?? [];
+    if (r.some((c) => c != null && String(c).trim() !== '')) break;
+    lastRow--;
+  }
+  const trimmed = rows.slice(0, Math.max(1, lastRow)).map((r) => (Array.isArray(r) ? [...r] : []));
+
+  let maxCols = 1;
+  for (const r of trimmed) maxCols = Math.max(maxCols, r.length);
+  for (const r of trimmed) {
+    while (r.length < maxCols) r.push('');
+  }
+
+  let headerIdx = 0;
+  for (let i = 0; i < Math.min(25, trimmed.length); i++) {
+    if (
+      trimmed[i]?.some((c) =>
+        String(c ?? '')
+          .toLowerCase()
+          .includes('sonar part code')
+      )
+    ) {
+      headerIdx = i;
+      break;
+    }
+  }
+
+  const newSheet = XLSX.utils.aoa_to_sheet(trimmed);
+  const lastColLetter = colLetterFrom1(maxCols);
+  const filterStart = headerIdx + 1;
+  const filterEnd = Math.max(filterStart, trimmed.length);
+  newSheet['!ref'] = `A1:${lastColLetter}${filterEnd}`;
+  newSheet['!autofilter'] = { ref: `A${filterStart}:${lastColLetter}${filterEnd}` };
+
+  // Duże numery SAP (ERP) — format całkowity zamiast notacji naukowej.
+  for (const addr of Object.keys(newSheet)) {
+    if (addr.startsWith('!')) continue;
+    const cell = newSheet[addr] as XLSX.CellObject | undefined;
+    if (!cell || typeof cell.v !== 'number' || !Number.isFinite(cell.v)) continue;
+    if (Number.isInteger(cell.v) && Math.abs(cell.v) >= 1e10) {
+      cell.z = '0';
+      cell.t = 'n';
+    }
+  }
+
+  const outWb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(outWb, newSheet, 'Input');
+  return Buffer.from(
+    XLSX.write(outWb, {
+      type: 'buffer',
+      bookType: 'xlsx',
+      compression: true,
+    })
+  );
 }
 
 function resolveWorkbookInputPath(buffer: Buffer): {
@@ -809,14 +1143,17 @@ function stripToInputOnlyNoMacros(buffer: Buffer): Buffer {
     }
   }
 
-  // relacje arkusza Input (tabele, rysunki, …)
+  // relacje arkusza Input (bez Excel Table — blokują kopiowanie całych kolumn)
   const sheetBase = inputPath.replace(/^xl\/worksheets\//i, '');
   const sheetRelsPath = `xl/worksheets/_rels/${sheetBase}.rels`;
   const sheetRelsEntry = byName.get(sheetRelsPath);
+  let cleanedSheetRelsXml: string | null = null;
   if (sheetRelsEntry) {
     keep.add(sheetRelsPath);
     const sheetRelsXml = inflateZipEntry(sheetRelsEntry).toString('utf8');
-    for (const target of collectRelationshipTargets(sheetRelsXml, 'xl/worksheets')) {
+    cleanedSheetRelsXml = stripTableRelationshipsFromSheetRels(sheetRelsXml);
+    for (const target of collectRelationshipTargets(cleanedSheetRelsXml, 'xl/worksheets')) {
+      if (/^xl\/tables\//i.test(target)) continue;
       keep.add(target);
       // relacje rysunków / wykresów
       if (/^xl\/drawings\/drawing\d+\.xml$/i.test(target)) {
@@ -842,7 +1179,9 @@ function stripToInputOnlyNoMacros(buffer: Buffer): Buffer {
     .replace(/\bsheetId='[^']*'/i, "sheetId='1'");
   const sheetsOpen = sheetsBlock.match(/^<(?:\w+:)?sheets\b[^>]*>/i)?.[0] ?? '<sheets>';
   const sheetsClose = sheetsBlock.match(/<\/(?:\w+:)?sheets>$/i)?.[0] ?? '</sheets>';
-  const newWbXml = wbXml.replace(sheetsBlock, `${sheetsOpen}${normalizedSheet}${sheetsClose}`);
+  const newWbXml = stripWorkbookStructureLocks(
+    wbXml.replace(sheetsBlock, `${sheetsOpen}${normalizedSheet}${sheetsClose}`)
+  );
 
   // workbook rels — Input + style/theme/sharedStrings (bez innych sheetów i VBA)
   const relTags = [...relsXml.matchAll(/<Relationship\b[^>]*\/?>/gi)].map((m) => m[0]);
@@ -915,9 +1254,32 @@ function stripToInputOnlyNoMacros(buffer: Buffer): Buffer {
   replacements.set('xl/workbook.xml', Buffer.from(newWbXml, 'utf8'));
   replacements.set('xl/_rels/workbook.xml.rels', Buffer.from(newRelsXml, 'utf8'));
   replacements.set('[Content_Types].xml', Buffer.from(ctXml, 'utf8'));
+  if (cleanedSheetRelsXml != null) {
+    replacements.set(sheetRelsPath, Buffer.from(cleanedSheetRelsXml, 'utf8'));
+  }
+
+  // Input: upewnij się, że nie zostały merge/tableParts/ochrona (gdy strip idzie bez mutate)
+  const inputEntry = byName.get(inputPath);
+  if (inputEntry) {
+    const inputXml0 = inflateZipEntry(inputEntry).toString('utf8');
+    const inputCleared = clearFiltersAndUnhideInXml(inputXml0, { isTable: false });
+    if (inputCleared !== inputXml0) {
+      replacements.set(inputPath, Buffer.from(inputCleared, 'utf8'));
+    }
+  }
+
+  const stylesEntry = byName.get('xl/styles.xml');
+  if (stylesEntry) {
+    const stylesXml = inflateZipEntry(stylesEntry).toString('utf8');
+    const stylesUnlocked = unlockStylesXml(stylesXml);
+    if (stylesUnlocked !== stylesXml) {
+      replacements.set('xl/styles.xml', Buffer.from(stylesUnlocked, 'utf8'));
+    }
+  }
 
   return rewriteZipEntriesFiltered(buffer, replacements, (name) => {
     if (/vbaProject/i.test(name)) return false;
+    if (/^xl\/tables\//i.test(name)) return false;
     if (/^xl\/worksheets\/[^/]+\.xml$/i.test(name)) return name === inputPath;
     if (/^xl\/worksheets\/_rels\//i.test(name)) return name === sheetRelsPath;
     if (keep.has(name)) return true;
@@ -1019,7 +1381,7 @@ async function clearWorkbookFiltersAndUnhide(buffer: Buffer): Promise<Buffer> {
 /**
  * Uzupełnia arkusz Input (Katowice_Data):
  * - X, AB, AC, AD, AE z bazy Capacity + tabela przejścia
- * - AK (S1619); CW + DB/DC + CY oraz DI + DN/DO + DK (S2102) z routingu SAP
+ * - AK (S1619); CW + DB/DC + CY oraz DI + DN/DO + DK (S2102) z routingu SAP (BOM wielopoziomowy)
  * - brak S2102 → czyszczenie całego bloku CR–DC / DD–DO wartościami 0 (m.in. Machinegroup HL)
  * Filtry wyłączane + wiersze odkrywane; wynik OCU: .xlsx bez makr, tylko Input.
  * Brak dopasowania → 0 (nadpisuje wcześniejsze wartości z szablonu).
@@ -1027,9 +1389,22 @@ async function clearWorkbookFiltersAndUnhide(buffer: Buffer): Promise<Buffer> {
 export async function generateOcuKatowiceWorkbook(
   transitionBuffer: Buffer,
   katowiceBuffer: Buffer,
-  routingBuffer: Buffer
+  routingBuffer: Buffer,
+  options?: {
+    katowicePassword?: string | null;
+    columnMapping?: Partial<OcuColumnLetters> | null;
+  }
 ): Promise<OcuDataGenerateResult> {
   const JSZip = (await import('jszip')).default;
+  const letters = mergeOcuColumnLetters(options?.columnMapping);
+  const s2102Blocks = buildS2102BlocksFromLetters(letters);
+
+  // Hasło otwarcia nie da się ominąć — odszyfruj przed odczytem Input / OOXML.
+  const katowiceUnlocked = await readWorkbookBufferWithOptionalPassword(
+    katowiceBuffer,
+    options?.katowicePassword,
+    'Katowice_Data'
+  );
 
   const transitionNoFilter = await clearWorkbookFiltersAndUnhide(transitionBuffer);
   const routingIndex: SapRoutingIndex = parseSapRoutingBuffer(routingBuffer);
@@ -1040,7 +1415,7 @@ export async function generateOcuKatowiceWorkbook(
     erpBySonarYear.set(`${row.sonar}|${row.year}`, row.erp);
   }
 
-  const { rows, headerRowNum, cols } = findInputSheetMatrix(katowiceBuffer);
+  const { rows, headerRowNum, cols } = findInputSheetMatrix(katowiceUnlocked, letters);
   const yearsNeeded: number[] = transition.map((t) => t.year);
   for (let i = headerRowNum; i < rows.length; i++) {
     const y = asYear(rows[i]?.[cols.year - 1]);
@@ -1101,10 +1476,11 @@ export async function generateOcuKatowiceWorkbook(
       if (!erp || erp === '0') {
         stats.unmatched_erp_in_db++;
       } else {
-        const profile = profiles.get(normSapKey(erp));
-        if (!profile) {
+        const resolved = resolveDetailProfileByErp(profiles, erp);
+        if (!resolved) {
           stats.unmatched_erp_in_db++;
         } else {
+          const { profile } = resolved;
           const line = pickLineForYear(profile, year);
           if (line) {
             xValue = `L${line}`;
@@ -1133,8 +1509,9 @@ export async function generateOcuKatowiceWorkbook(
         if (!hasFg) {
           stats.unmatched_routing++;
         } else {
-          s1619 = componentsWithCode(routingIndex, fgKey, 'S1619');
-          const s2102All = componentsWithCode(routingIndex, fgKey, 'S2102');
+          // Wielopoziomowy BOM: S2102/S1619 mogą być pod półproduktem (np. FG → 10670608… → S2102 = HL).
+          s1619 = componentsWithCodeDeep(routingIndex, fgKey, 'S1619');
+          const s2102All = componentsWithCodeDeep(routingIndex, fgKey, 'S2102');
           const split = splitS2102ByFormatka(s2102All);
           s2102Large = split.large;
           s2102Small = split.small;
@@ -1148,29 +1525,37 @@ export async function generateOcuKatowiceWorkbook(
     cellUpdates.set(`${colAd}${excelRow}`, adValue);
     cellUpdates.set(`${colAe}${excelRow}`, aeValue);
 
-    stats.filled_s1619 += writeRoutingErpNo(cellUpdates, excelRow, S1619_ERP_COL, s1619);
+    stats.filled_s1619 += writeRoutingErpNo(
+      cellUpdates,
+      excelRow,
+      letters.s1619Erp,
+      s1619,
+      letters.s1619MachineGroup
+    );
     stats.filled_s2102_large += writeS2102Block(
       cellUpdates,
       excelRow,
-      S2102_BLOCK_COLS.large,
+      s2102Blocks.large,
       s2102Large,
       routingIndex
     );
     stats.filled_s2102_small += writeS2102Block(
       cellUpdates,
       excelRow,
-      S2102_BLOCK_COLS.small,
+      s2102Blocks.small,
       s2102Small,
       routingIndex
     );
   }
 
   const { cleaned: katowiceNoFilterRaw, filled: katowiceFilled } = mutateKatowicePackage(
-    katowiceBuffer,
+    katowiceUnlocked,
     cellUpdates
   );
-  const katowiceNoFilter = stripMacrosToXlsx(katowiceNoFilterRaw);
-  const katowiceOcu = stripToInputOnlyNoMacros(katowiceFilled);
+  // Pełne odblokowanie wersji „bez filtrów” (zachowuje wygląd szablonu).
+  const katowiceNoFilter = makeWorkbookFullyEditable(stripMacrosToXlsx(katowiceNoFilterRaw));
+  // OCU: nowy czysty .xlsx (bez merge/tabel/ochrony) — kopiowanie wierszy i filtry działają.
+  const katowiceOcu = rebuildPlainInputWorkbook(katowiceFilled);
 
   const outZip = new JSZip();
   outZip.file('Tabela_przejscia.xlsx', transitionNoFilter);

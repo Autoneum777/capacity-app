@@ -127,23 +127,57 @@ export function mondayOfIsoWeek(year: number, month: number, day: number): Date 
   return d;
 }
 
-/**
- * Liczba tygodni pn–nd w miesiącu.
- * Częściowe tygodnie na początku/końcu miesiąca też się liczą (jak w ISO / SAP CW).
- */
-export function getWeekCountInMonth(year: number, month: number): number {
+/** Poniedziałki kalendarzowe wypadające w danym miesiącu (kolejność rosnąca). */
+export function mondaysFallingInMonth(year: number, month: number): Date[] {
   const daysInMonth = new Date(year, month, 0).getDate();
-  if (daysInMonth < 1) return 1;
-  const firstMon = mondayOfIsoWeek(year, month, 1);
-  const lastMon = mondayOfIsoWeek(year, month, daysInMonth);
-  return Math.max(1, Math.round((lastMon.getTime() - firstMon.getTime()) / 86400000 / 7) + 1);
+  if (daysInMonth < 1) return [];
+  const out: Date[] = [];
+  for (let day = 1; day <= daysInMonth; day++) {
+    const d = new Date(year, month - 1, day);
+    if (d.getDay() !== 1) continue;
+    d.setHours(0, 0, 0, 0);
+    out.push(d);
+  }
+  return out;
 }
 
-/** Numer tygodnia w miesiącu (1 = pierwszy tydzień pn–nd mający co najmniej jeden dzień w miesiącu). */
+/**
+ * Tydzień pn–nd przypisujemy do miesiąca, w którym się zaczyna (poniedziałek).
+ * Całomy miesięcy nie dublują tego samego CW w dwóch miesiącach.
+ */
+export function assignIsoWeekToStartMonth(
+  year: number,
+  month: number,
+  day: number
+): { year: number; month: number; week: number } {
+  const mon = mondayOfIsoWeek(year, month, day);
+  const y = mon.getFullYear();
+  const m = mon.getMonth() + 1;
+  const mondays = mondaysFallingInMonth(y, m);
+  const t = mon.getTime();
+  let week = 1;
+  for (let i = 0; i < mondays.length; i++) {
+    if (mondays[i].getTime() === t) {
+      week = i + 1;
+      break;
+    }
+  }
+  return { year: y, month: m, week };
+}
+
+/**
+ * Liczba tygodni w miesiącu = liczba poniedziałków w tym miesiącu
+ * (tydzień na przełomie należy tylko do miesiąca startu).
+ */
+export function getWeekCountInMonth(year: number, month: number): number {
+  return Math.max(1, mondaysFallingInMonth(year, month).length);
+}
+
+/**
+ * Numer tygodnia w miesiącu startu tygodnia (1 = pierwszy poniedziałek miesiąca).
+ * Dla dat z „ogona” tygodnia zaczynającego się w poprzednim miesiącu zwraca indeks w miesiącu startu
+ * — preferuj {@link assignIsoWeekToStartMonth}, gdy potrzebujesz też poprawnego miesiąca/roku.
+ */
 export function weekOfMonthFromDate(year: number, month: number, day: number): number {
-  const daysInMonth = new Date(year, month, 0).getDate();
-  const d = Math.min(Math.max(1, Math.floor(Number(day)) || 1), Math.max(1, daysInMonth));
-  const firstMon = mondayOfIsoWeek(year, month, 1);
-  const thisMon = mondayOfIsoWeek(year, month, d);
-  return Math.max(1, Math.round((thisMon.getTime() - firstMon.getTime()) / 86400000 / 7) + 1);
+  return assignIsoWeekToStartMonth(year, month, day).week;
 }

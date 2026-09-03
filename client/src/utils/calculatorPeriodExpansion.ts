@@ -61,11 +61,21 @@ export function periodMachineMonthKey(machineId: number, month: number): string 
 }
 
 export function getWeekCountInMonth(year: number, month: number): number {
+  return Math.max(1, mondaysFallingInMonth(year, month).length);
+}
+
+/** Poniedziałki kalendarzowe wypadające w danym miesiącu. */
+export function mondaysFallingInMonth(year: number, month: number): Date[] {
   const daysInMonth = new Date(year, month, 0).getDate();
-  if (daysInMonth < 1) return 1;
-  const firstMon = mondayOfIsoWeek(year, month, 1);
-  const lastMon = mondayOfIsoWeek(year, month, daysInMonth);
-  return Math.max(1, Math.round((lastMon.getTime() - firstMon.getTime()) / 86400000 / 7) + 1);
+  if (daysInMonth < 1) return [];
+  const out: Date[] = [];
+  for (let day = 1; day <= daysInMonth; day++) {
+    const d = new Date(year, month - 1, day);
+    if (d.getDay() !== 1) continue;
+    d.setHours(0, 0, 0, 0);
+    out.push(d);
+  }
+  return out;
 }
 
 /** Poniedziałek tygodnia ISO (pn–nd) zawierającego podaną datę (czas lokalny). */
@@ -78,13 +88,33 @@ export function mondayOfIsoWeek(year: number, month: number, day: number): Date 
   return d;
 }
 
-/** Numer tygodnia w miesiącu (1 = pierwszy tydzień pn–nd mający co najmniej jeden dzień w miesiącu). */
+/**
+ * Tydzień pn–nd → miesiąc startu (poniedziałek) + numer tygodnia w tym miesiącu.
+ * Przełom miesięcy: jeden CW tylko w miesiącu rozpoczęcia.
+ */
+export function assignIsoWeekToStartMonth(
+  year: number,
+  month: number,
+  day: number
+): { year: number; month: number; week: number } {
+  const mon = mondayOfIsoWeek(year, month, day);
+  const y = mon.getFullYear();
+  const m = mon.getMonth() + 1;
+  const mondays = mondaysFallingInMonth(y, m);
+  const t = mon.getTime();
+  let week = 1;
+  for (let i = 0; i < mondays.length; i++) {
+    if (mondays[i].getTime() === t) {
+      week = i + 1;
+      break;
+    }
+  }
+  return { year: y, month: m, week };
+}
+
+/** Numer tygodnia w miesiącu startu tygodnia (1 = pierwszy poniedziałek miesiąca). */
 export function weekOfMonthFromDate(year: number, month: number, day: number): number {
-  const daysInMonth = new Date(year, month, 0).getDate();
-  const d = Math.min(Math.max(1, Math.floor(Number(day)) || 1), Math.max(1, daysInMonth));
-  const firstMon = mondayOfIsoWeek(year, month, 1);
-  const thisMon = mondayOfIsoWeek(year, month, d);
-  return Math.max(1, Math.round((thisMon.getTime() - firstMon.getTime()) / 86400000 / 7) + 1);
+  return assignIsoWeekToStartMonth(year, month, day).week;
 }
 
 export function buildHorizontalTimelineColumns(
@@ -207,13 +237,19 @@ export function isoWeekNumber(date: Date): number {
 }
 
 /**
- * Tydzień kalendarzowy (ISO / CW) dla T1…Tn w miesiącu (wiadra pn–nd).
- * Etykieta = numer ISO tygodnia (czwartek tygodnia — reguła ISO).
+ * Tydzień kalendarzowy (ISO / CW) dla T1…Tn w miesiącu.
+ * T1 = pierwszy poniedziałek miesiąca (tydzień na przełomie → miesiąc startu).
  */
 export function calendarWeekForMonthWeek(year: number, month: number, weekOfMonth: number): number {
+  const mondays = mondaysFallingInMonth(year, month);
+  if (!mondays.length) {
+    const monday = mondayOfIsoWeek(year, month, 1);
+    const thursday = new Date(monday);
+    thursday.setDate(monday.getDate() + 3);
+    return isoWeekNumber(thursday);
+  }
   const w = Math.max(1, Math.floor(Number(weekOfMonth)) || 1);
-  const monday = mondayOfIsoWeek(year, month, 1);
-  monday.setDate(monday.getDate() + (w - 1) * 7);
+  const monday = mondays[Math.min(w, mondays.length) - 1]!;
   const thursday = new Date(monday);
   thursday.setDate(monday.getDate() + 3);
   return isoWeekNumber(thursday);

@@ -149,7 +149,7 @@ usersAdminRouter.post('/:id/reset-password', requirePermission('user_management.
   try {
     const id = Number(req.params.id);
     const sendEmail = req.body?.send_email === true;
-    const result = await issuePasswordResetForUser(id, req.user!.id, sendEmail ? 'email' : 'admin_link');
+    const result = await issuePasswordResetForUser(id, req.user!.id, sendEmail ? 'email' : 'admin_link', req);
     res.json(result);
   } catch (e: any) {
     res.status(500).json({ error: e?.message || 'Błąd generowania linku resetu' });
@@ -187,7 +187,7 @@ usersAdminRouter.patch('/password-reset-requests/:id', requirePermission('user_m
     }
     if (action === 'approve') {
       const sendEmail = req.body?.send_email === true;
-      const result = await issuePasswordResetForUser(Number(row.user_id), req.user!.id, sendEmail ? 'email' : 'request');
+      const result = await issuePasswordResetForUser(Number(row.user_id), req.user!.id, sendEmail ? 'email' : 'request', req);
       db.prepare(
         `UPDATE password_reset_requests SET status = 'approved', resolved_at = datetime('now'), resolved_by_user_id = ? WHERE id = ?`
       ).run(req.user!.id, id);

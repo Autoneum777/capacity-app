@@ -307,16 +307,30 @@ export const api = {
           file_exists: boolean | null;
         }[];
       }>('/admin/attachments'),
-    generateOcuData: async (transition: File, katowice: File, routing: File) => {
+    generateOcuData: async (
+      transition: File,
+      katowice: File,
+      routing: File,
+      options?: { katowicePassword?: string; columnMapping?: Record<string, string> }
+    ) => {
       const fd = new FormData();
+      const pwd = String(options?.katowicePassword ?? '').trim();
+      // Hasło pierwsze w multipart + nagłówek — duże pliki / proxy czasem gubią pola tekstowe na końcu.
+      if (pwd) fd.append('katowicePassword', pwd);
+      if (options?.columnMapping) {
+        fd.append('columnMapping', JSON.stringify(options.columnMapping));
+      }
       fd.append('transition', transition);
       fd.append('katowice', katowice);
       fd.append('routing', routing);
+      const headers: Record<string, string> = {};
+      if (pwd) headers['X-Katowice-Password'] = pwd;
       let res: Response;
       try {
         res = await fetch(`${BASE}/admin/ocu-data/generate`, {
           method: 'POST',
           body: fd,
+          headers,
           credentials: 'include',
           cache: 'no-store',
         });
@@ -362,6 +376,41 @@ export const api = {
       a.remove();
       URL.revokeObjectURL(url);
       return { stats };
+    },
+    previewOcuHeaders: async (
+      katowice: File,
+      options?: { katowicePassword?: string; columnMapping?: Record<string, string> }
+    ) => {
+      const fd = new FormData();
+      const pwd = String(options?.katowicePassword ?? '').trim();
+      if (pwd) fd.append('katowicePassword', pwd);
+      if (options?.columnMapping) {
+        fd.append('columnMapping', JSON.stringify(options.columnMapping));
+      }
+      fd.append('katowice', katowice);
+      const headers: Record<string, string> = {};
+      if (pwd) headers['X-Katowice-Password'] = pwd;
+      let res: Response;
+      try {
+        res = await fetch(`${BASE}/admin/ocu-data/preview-headers`, {
+          method: 'POST',
+          body: fd,
+          headers,
+          credentials: 'include',
+          cache: 'no-store',
+        });
+      } catch (e) {
+        throw mapFetchFailure(e);
+      }
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error((data as { error?: string }).error || res.statusText || 'OCU preview failed');
+      }
+      return res.json() as Promise<{
+        headerRowNum: number;
+        headers: { letter: string; header: string; col1: number }[];
+        suggested: Record<string, string>;
+      }>;
     },
     startPickLocation: (body: { target: 'backup' | 'attachments' | 'backup-file'; initial_dir?: string }) =>
       request<{ job_id: string }>('/admin/pick-location/start', { method: 'POST', body: JSON.stringify(body) }),

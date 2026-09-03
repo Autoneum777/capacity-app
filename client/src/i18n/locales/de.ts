@@ -137,7 +137,30 @@ export const de: TranslationTree = {
     ocuDataTransitionHelp: '.xlsx — Spalte B = Sonar Part Code, C = ERP, D = Year. ZIP enthält Kopie ohne Filter.',
     ocuDataKatowiceTitle: '2. Katowice_Data',
     ocuDataKatowiceHelp:
-      '.xlsx / .xlsm — Blatt Input. S = Sonar Part Code, E = Jahr. Gefüllt: X, AB, AC, AD, AE (AE = Nesterzahl). OCU-Ausgabe: .xlsx ohne Makros, nur Input.',
+      '.xlsx / .xlsm — Blatt Input. Lese-/Schreibspalten unten nach Laden der Dateiköpfe einstellen. OCU-Ausgabe: .xlsx ohne Makros, nur Input.',
+    ocuDataKatowicePasswordLabel: 'Öffnungskennwort für Katowice_Data (optional)',
+    ocuDataKatowicePasswordPlaceholder: 'Nur wenn die Datei verschlüsselt ist',
+    ocuDataKatowicePasswordHelp:
+      'Ein Öffnungskennwort lässt sich nicht umgehen. Nur ausfüllen, wenn die Generierung meldet, dass die Datei passwortgeschützt ist.',
+    ocuDataFilePasswordProtected:
+      'Katowice_Data ist mit einem Öffnungskennwort verschlüsselt. Bitte Kennwort unten eingeben (lässt sich nicht umgehen).',
+    ocuDataFilePasswordWrong: 'Datei konnte nicht entschlüsselt werden — Öffnungskennwort für Katowice_Data prüfen.',
+    ocuColMappingTitle: 'Spaltenzuordnung Blatt Input',
+    ocuColMappingHelp:
+      'Bezeichnungen stammen aus den Dateiköpfen. Wurde nach „Sonar Part Code“ (S) eine Spalte eingefügt, „+1 nach S“ nutzen — X/AB/… und Routing rücken nach rechts. Zuordnung wird im Browser gespeichert.',
+    ocuColLoadHeaders: 'Köpfe aus Datei laden',
+    ocuColLoadingHeaders: 'Köpfe werden geladen…',
+    ocuColShiftAfterS: '+1 Spalten nach S verschieben',
+    ocuColResetDefaults: 'Standardbuchstaben wiederherstellen',
+    ocuColHeadersLoaded: 'Köpfe aus Zeile {{row}} ({{count}} benannte Spalten).',
+    ocuColColHeader: 'Spalte / Kopf',
+    ocuColColLetter: 'Buchstabe',
+    ocuColColFromFile: 'Kopf in Datei',
+    ocuColHeaderMissing: 'Kein Kopf unter diesem Buchstaben',
+    ocuColSectionRead: 'Lesen',
+    ocuColSectionCapacity: 'Capacity schreiben (Opt1cxx)',
+    ocuColSectionRouting: 'Routing schreiben (S1619 / S2102)',
+    ocuDataPreviewFailed: 'Köpfe aus Katowice_Data konnten nicht geladen werden.',
     ocuDataRoutingTitle: '3. SAP-Routing',
     ocuDataRoutingHelp:
       '.txt (Task List Print List). S1619 → AK. S2102: Materialnr. → CW/DI, Maße L×W → DB+DC / DN+DO, Base Qty → CY/DK. Ohne S2102: CR–DC / DD–DO = 0 (inkl. HL).',
@@ -539,7 +562,8 @@ export const de: TranslationTree = {
     errScopeRequired: 'Szenario-Umfang eingeben (Pflichtfeld).',
     errPickSource: 'Quellszenario wählen.',
     volumeSection: 'Produktionsvolumen',
-    volumeSectionHint: 'Unabhängig vom Ausgangspunkt — betrifft nur Volumendaten im Szenario-Rechner.',
+    volumeSectionHint:
+      'Unabhängig vom Ausgangspunkt. Bei Aktivierung zeigt der Rechner zwei Balken: Szenario-Produktion oben und Call offs unten — wie in der Call-offs-Ansicht.',
     useCallOffVolumes: 'Volumen aus Call offs (Vergleichsliste) verwenden',
     pickCallOff: '— Vergleich wählen —',
     errPickCallOff: 'Call-off-Vergleich mit importierten Volumen wählen.',
@@ -572,9 +596,10 @@ export const de: TranslationTree = {
   },
   calculator: {
     title: 'Kalkulator',
-    scenarioCallOffBanner: 'Produktionsvolumen durch Call-offs-Daten ersetzt: {{name}}',
+    scenarioCallOffBanner:
+      'Dual-Vergleich: Szenario-Produktionsauslastung oben, Call offs ({{name}}) unten.',
     scenarioCallOffBannerContract:
-      'Jahresbereich aus Call-offs-Daten ({{name}}). Im Vertragsmodus werden Vertragsvolumen aus dem Szenario angezeigt.',
+      'Dual-Vergleich: Vertragsvolumen des Szenarios oben, Call offs ({{name}}) unten.',
     yearFrom: 'Jahr von:',
     yearTo: 'Jahr bis:',
     machineType: 'Maschinentyp:',
@@ -668,12 +693,16 @@ export const de: TranslationTree = {
       saveAlt: 'Alternative speichern',
       execute: 'Allokation ausführen',
       executeTitle: 'Allokation ausführen',
-      operation: 'Operation:',
+      operation: 'Operationen (Teile):',
       operationLine: '{{part}} – {{phase}} (Volumen {{year}}: {{value}} {{unit}}, Summe: {{weekly}} {{weeklyLabel}})',
+      selectedOpsCount: '{{count}} ausgewählt',
+      multiSelectHelp:
+        'Mehrere Teile möglich. Manuelles Volumen / Ziel-% gilt gemeinsam für die Auswahl (anteilig nach Volumen). „Gesamt“ verschiebt 100 % jedes gewählten Teils.',
+      sopEopUnion: 'Maximaler SOP–EOP-Zeitraum für {{count}} Teile: {{years}}',
       weeklyLabel: 'wöchentlich',
       transferModeTitle: 'Art der Volumenverschiebung',
       modeFull: 'Gesamtes Detailvolumen verschieben',
-      modeFullHelp: 'Verschiebt 100 % des gewählten Detailvolumens (alle Operationen der Gruppe) für jedes gewählte Jahr.',
+      modeFullHelp: 'Verschiebt 100 % des Volumens jedes gewählten Details (alle Operationen der Gruppe) für jedes gewählte Jahr.',
       modeFullHelpPartial:
         'Verschiebt den Jahresanteil ab dem gewählten Monat/Woche bis Jahresende (weitere gewählte Jahre vollständig).',
       modeManual: 'Manuell eingegebenes Volumen',
@@ -742,7 +771,7 @@ export const de: TranslationTree = {
         ' Für Jahre {{years}} wurde das Volumen begrenzt — Detailvolumen reichte nicht für Ziel-{{percent}} % (gesamtes verfügbares Volumen verschoben).',
       allocationCappedManual: ' Für Jahre {{years}} wurde das Volumen auf das maximal verfügbare Detailvolumen begrenzt.',
       allocationSkipped: ' Jahre übersprungen {{years}} (kein mögliches Volumen bei diesem Ziel-% oder Volumen 0).',
-      selectOpMachineYear: 'Operation, Zielmaschine und mindestens ein Jahr wählen.',
+      selectOpMachineYear: 'Mindestens eine Operation, Zielmaschine und ein Jahr wählen.',
       customCycleRequired: 'Positive Zykluszeit [s] unter „Neue Zykluszeit“ eingeben oder andere Option wählen.',
       noAltCycle: 'Diese Operation hat keine alternative Zykluszeit.',
     },

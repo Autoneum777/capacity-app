@@ -203,12 +203,13 @@ authRouter.post('/reset-password', async (req, res) => {
 export async function issuePasswordResetForUser(
   userId: number,
   createdByUserId: number | null,
-  via: 'email' | 'admin_link' | 'request'
+  via: 'email' | 'admin_link' | 'request',
+  req?: { get: (name: string) => string | undefined; protocol?: string } | null
 ): Promise<{ reset_url: string; email_sent: boolean }> {
   const user = getUserById(userId);
   if (!user) throw new Error('Użytkownik nie istnieje');
   const { token } = createPasswordResetToken(userId, via, createdByUserId ?? undefined);
-  const reset_url = buildResetPasswordUrl(token);
+  const reset_url = buildResetPasswordUrl(token, req);
   let email_sent = false;
   if (via === 'email' || isSmtpReady()) {
     const to = user.email;

@@ -51,6 +51,7 @@ import {
   type YearSopEopMarkers,
 } from '../utils/calculatorPeriodExpansion';
 import DualLoadCell from '../components/capacity/DualLoadCell';
+import CalcCellHoverTip from '../components/capacity/CalcCellHoverTip';
 import { loadColor } from '../utils/loadCellColors';
 import { isYearInProjectSopEop, sopEopYearsRange } from '../utils/sopEopFormat';
 import {
@@ -905,11 +906,13 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
   const { useContractualVolumes } = useContractVolumes();
   const scenarioId = callOffMode
     ? undefined
-    : Number.isFinite(scenarioFromUrl) && scenarioFromUrl > 0
-      ? scenarioFromUrl
-      : appSection === 'scenarios' && ctxScenarioId != null && ctxScenarioId > 0
-        ? ctxScenarioId
-        : undefined;
+    : appSection === 'scenarios'
+      ? Number.isFinite(scenarioFromUrl) && scenarioFromUrl > 0
+        ? scenarioFromUrl
+        : ctxScenarioId != null && ctxScenarioId > 0
+          ? ctxScenarioId
+          : undefined
+      : undefined;
   const scenarioActive = !callOffMode && scenarioId != null && !isNaN(scenarioId) && scenarioId > 0;
   const settingsProfile = useEffectiveCalculationProfile(scenarioActive);
   const [callOffMeta, setCallOffMeta] = useState<{
@@ -924,13 +927,17 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
     name: string;
     source_filename?: string | null;
   } | null>(null);
+  /** Dual tylko w Call offs albo w aktywnym scenariuszu z podpiętym Call offs — nigdy w Wersji produkcyjnej. */
+  const scenarioCallOffDual =
+    scenarioActive && scenarioCallOffComparisonId != null && scenarioCallOffComparisonId > 0;
+  const dualBarsMode = callOffMode || scenarioCallOffDual;
   /** Nie ładuj kalkulatora z domyślnym zakresem 12 lat zanim znanę będą lata Call offs / metadane scenariusza. */
   const [timelineYearsReady, setTimelineYearsReady] = useState(() => {
     if (callOffMode) return false;
     if (Number.isFinite(scenarioFromUrl) && scenarioFromUrl > 0) return false;
     return true;
   });
-  const callOffPeriodStyleMode = callOffMode;
+  const callOffPeriodStyleMode = dualBarsMode;
   const [data, setData] = useState<{
     yearFrom: number;
     yearTo: number;
@@ -1159,12 +1166,16 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
       }
       return;
     }
+    let cancelled = false;
     setTimelineYearsReady(false);
     setData(null);
     setLoading(true);
+    setScenarioCallOffComparisonId(null);
+    setScenarioCallOffMeta(null);
     api.scenarios
       .get(scenarioId)
       .then(async (s) => {
+        if (cancelled) return;
         setActiveScenario(scenarioId, s.name);
         const coId = s.source_call_off_comparison_id;
         if (coId != null && coId > 0) {
@@ -1172,6 +1183,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
           setScenarioCallOffComparisonId(coId);
           try {
             const row = await api.callOffs.get(coId);
+            if (cancelled) return;
             setScenarioCallOffMeta({ name: row.name, source_filename: row.source_filename });
             const { from, to } = resolveCallOffDataYearRange(row);
             setYearFrom(from);
@@ -1179,18 +1191,21 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
             setDebouncedYearFrom(from);
             setDebouncedYearTo(to);
           } catch {
-            setScenarioCallOffMeta(null);
+            if (!cancelled) setScenarioCallOffMeta(null);
           }
         } else {
           yearsLockedByCallOffRef.current = false;
           setScenarioCallOffComparisonId(null);
           setScenarioCallOffMeta(null);
         }
-        setTimelineYearsReady(true);
+        if (!cancelled) setTimelineYearsReady(true);
       })
       .catch(() => {
-        setTimelineYearsReady(true);
+        if (!cancelled) setTimelineYearsReady(true);
       });
+    return () => {
+      cancelled = true;
+    };
   }, [scenarioId, callOffMode, setActiveScenario]);
 
   const effectiveYearFrom = Math.min(debouncedYearFrom, debouncedYearTo);
@@ -1890,7 +1905,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
       setYearTo(safeFrom + 1);
       setDebouncedYearFrom(safeFrom);
       setDebouncedYearTo(safeFrom + 1);
-    } else if (scenarioCallOffComparisonId != null && scenarioCallOffComparisonId > 0) {
+    } else if (scenarioCallOffDual && scenarioCallOffComparisonId != null && scenarioCallOffComparisonId > 0) {
       api.callOffs
         .get(scenarioCallOffComparisonId)
         .then((row) => {
@@ -2122,9 +2137,9 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
         const sum = selected.reduce((acc: number, m: any) => acc + yearLoad(m, y), 0);
         const avg = selected.length > 0 ? sum / selected.length : 0;
         const maxTypeAvg = maxTypeAverageLoad(selected, (m: any) => yearLoad(m, y)) ?? 0;
-        const sumCo = callOffMode ? selected.reduce((acc: number, m: any) => acc + yearCallOffLoad(m, y), 0) : 0;
-        const avgCo = callOffMode && selected.length > 0 ? sumCo / selected.length : 0;
-        const maxTypeAvgCo = callOffMode
+        const sumCo = dualBarsMode ? selected.reduce((acc: number, m: any) => acc + yearCallOffLoad(m, y), 0) : 0;
+        const avgCo = dualBarsMode && selected.length > 0 ? sumCo / selected.length : 0;
+        const maxTypeAvgCo = dualBarsMode
           ? maxTypeAverageLoad(selected, (m: any) => yearCallOffLoad(m, y)) ?? 0
           : 0;
         return { y, sum, avg, maxTypeAvg, sumCo, avgCo, maxTypeAvgCo };
@@ -2191,7 +2206,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
       const operationRows: any[] = [];
       const callOffDetailRows: any[] = [];
       if (reportIncludeOperationDetails && selected.length > 0) {
-        if (callOffMode) {
+        if (dualBarsMode) {
           for (const m of selected) {
             for (const y of years) {
               const cell = m.years?.[y];
@@ -2315,7 +2330,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
 
       if (reportFormat === 'excel') {
         const wb = XLSX.utils.book_new();
-        const yearHeaders = callOffMode
+        const yearHeaders = dualBarsMode
           ? years.flatMap((y) => [
               `${y} ${t('reports.calculator.colLoadBase')}`,
               `${y} ${t('reports.calculator.colLoadCallOff')}`,
@@ -2327,7 +2342,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
             excelExportCell(m.sap_number ?? '') ?? '-',
             excelExportCell(m.internal_number ?? '') ?? '-',
             m.type ?? '-',
-            ...(callOffMode
+            ...(dualBarsMode
               ? years.flatMap((y) => [Math.round(yearLoad(m, y)), Math.round(yearCallOffLoad(m, y))])
               : years.map((y) => Math.round(yearLoad(m, y)))),
           ]),
@@ -2335,7 +2350,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
             t('reports.calculator.sumRow'),
             '',
             '',
-            ...(callOffMode
+            ...(dualBarsMode
               ? summary.flatMap((s) => [Math.round(s.sum), Math.round(s.sumCo)])
               : summary.map((s) => Math.round(s.sum))),
           ],
@@ -2343,7 +2358,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
             t('reports.calculator.avgRow'),
             '',
             '',
-            ...(callOffMode
+            ...(dualBarsMode
               ? summary.flatMap((s) => [Math.round(s.avg), Math.round(s.avgCo)])
               : summary.map((s) => Math.round(s.avg))),
           ],
@@ -2351,7 +2366,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
             t('reports.calculator.maxTypeAvgRow'),
             '',
             '',
-            ...(callOffMode
+            ...(dualBarsMode
               ? summary.flatMap((s) => [Math.round(s.maxTypeAvg), Math.round(s.maxTypeAvgCo)])
               : summary.map((s) => Math.round(s.maxTypeAvg))),
           ],
@@ -2525,7 +2540,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
           pdfSafe(String(m.internal_number ?? '-')),
           pdfSafe(String(m.type ?? '-')),
           ...years.map((y) =>
-            callOffMode ? dualPct(yearLoad(m, y), yearCallOffLoad(m, y)) : `${Number(yearLoad(m, y))}%`
+            dualBarsMode ? dualPct(yearLoad(m, y), yearCallOffLoad(m, y)) : `${Number(yearLoad(m, y))}%`
           ),
         ]);
         const sumRowReportPdf: any[] = [
@@ -2540,7 +2555,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
             },
           },
           ...summary.map((s) => ({
-            content: callOffMode ? dualPct(s.sum, s.sumCo) : `${Math.round(s.sum)}%`,
+            content: dualBarsMode ? dualPct(s.sum, s.sumCo) : `${Math.round(s.sum)}%`,
             styles: {
               fontStyle: 'bold' as const,
               halign: 'center' as const,
@@ -2564,7 +2579,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
             },
           },
           ...summary.map((s) => ({
-            content: callOffMode ? dualPct(s.avg, s.avgCo) : `${Math.round(s.avg)}%`,
+            content: dualBarsMode ? dualPct(s.avg, s.avgCo) : `${Math.round(s.avg)}%`,
             styles: {
               fontStyle: 'bold' as const,
               halign: 'center' as const,
@@ -2588,7 +2603,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
             },
           },
           ...summary.map((s) => ({
-            content: callOffMode ? dualPct(s.maxTypeAvg, s.maxTypeAvgCo) : `${Math.round(s.maxTypeAvg)}%`,
+            content: dualBarsMode ? dualPct(s.maxTypeAvg, s.maxTypeAvgCo) : `${Math.round(s.maxTypeAvg)}%`,
             styles: {
               fontStyle: 'bold' as const,
               halign: 'center' as const,
@@ -2793,7 +2808,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
           )}
         </div>
       </div>
-      {scenarioCallOffComparisonId != null && scenarioCallOffComparisonId > 0 && scenarioCallOffMeta && (
+      {scenarioCallOffDual && scenarioCallOffMeta && (
         <p
           style={{
             margin: '0 0 1rem',
@@ -3203,7 +3218,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                   const cell = m.years?.[yearForCell];
                   const monthsData = col.kind === 'year' ? undefined : getMachineMonthsData(m.machine_id, yearForCell);
                   const pct = getTimelineColumnLoad(col, cell?.load_percent, monthsData);
-                  const coPct = callOffMode
+                  const coPct = dualBarsMode
                     ? getTimelineColumnCallOffLoad(col, cell?.call_off_load_percent, monthsData)
                     : 0;
                   const isYearCell = col.kind === 'year';
@@ -3225,15 +3240,12 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                   const monthNum = col.kind === 'month' || col.kind === 'week' ? col.month : undefined;
                   const weekNum = col.kind === 'week' ? col.week : undefined;
                   const baseBreakdown = getTimelineBaseBreakdown(col, cell, monthsData);
-                  const callOffBreakdown = callOffMode
+                  const callOffBreakdown = dualBarsMode
                     ? getTimelineCallOffBreakdown(col, cell, monthsData)
                     : undefined;
-                  const volumePeriod = callOffMode && isYearCell ? 'monthly' : timelineVolumePeriod(col);
-                  /** SAP: miesiąc/rok = średnia w zakresie danych → ilości w breakdown odpowiadają tygodniowi najbliższemu średniej. */
-                  const callOffVolumePeriod =
-                    callOffMode && (isYearCell || col.kind === 'month') ? 'weekly' : volumePeriod;
-                  const canAllocPeriod = tableCanAllocate && !callOffMode;
-                  const cellTitle = callOffMode
+                  const volumePeriod = dualBarsMode && isYearCell ? 'monthly' : timelineVolumePeriod(col);
+                  const canAllocPeriod = tableCanAllocate;
+                  const cellTitle = dualBarsMode
                     ? callOffCellTitle(
                         yearForCell,
                         monthNum,
@@ -3243,8 +3255,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                         locale,
                         t,
                         volumePeriod,
-                        tableCanAllocate && isYearCell,
-                        callOffVolumePeriod
+                        tableCanAllocate && isYearCell
                       )
                     : isYearCell
                       ? percentCellTitle(yearForCell, altB, baseBreakdown, locale, t, tableCanAllocate)
@@ -3300,7 +3311,6 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                               canAllocPeriod || (tableCanAllocate && isYearCell)
                             )
                       }
-                      title={cellTitle}
                       onClick={
                         canAllocPeriod || (tableCanAllocate && isYearCell) ? openAllocation : undefined
                       }
@@ -3315,26 +3325,28 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                           : undefined
                       }
                     >
-                      {renderCapacityCellContent(callOffMode, periodCellPending, pct, coPct, monthMarkers, visualSettings, t)}
-                      {visualSettings.show_rfq_badge && isYearCell && cell?.has_rfq && (
-                        <span
-                          style={{
-                            position: 'absolute',
-                            top: 2,
-                            right: 2,
-                            padding: '1px 4px',
-                            borderRadius: 10,
-                            fontSize: 10,
-                            lineHeight: 1.1,
-                            fontWeight: 700,
-                            background: '#A4C400CC',
-                            color: '#fff',
-                            pointerEvents: 'none',
-                          }}
-                        >
-                          RFQ
-                        </span>
-                      )}
+                      <CalcCellHoverTip text={cellTitle}>
+                        {renderCapacityCellContent(dualBarsMode, periodCellPending, pct, coPct, monthMarkers, visualSettings, t)}
+                        {visualSettings.show_rfq_badge && isYearCell && cell?.has_rfq && (
+                          <span
+                            style={{
+                              position: 'absolute',
+                              top: 2,
+                              right: 2,
+                              padding: '1px 4px',
+                              borderRadius: 10,
+                              fontSize: 10,
+                              lineHeight: 1.1,
+                              fontWeight: 700,
+                              background: '#A4C400CC',
+                              color: '#fff',
+                              pointerEvents: 'none',
+                            }}
+                          >
+                            RFQ
+                          </span>
+                        )}
+                      </CalcCellHoverTip>
                     </td>
                   );
                 })}
@@ -3405,7 +3417,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                       {years.map((y) => {
                         const monthsData = getMachineMonthsData(m.machine_id, y);
                         const pct = getVerticalCellLoad(y, row, monthsData);
-                        const coPct = callOffMode ? getVerticalCellCallOffLoad(y, row, monthsData) : 0;
+                        const coPct = dualBarsMode ? getVerticalCellCallOffLoad(y, row, monthsData) : 0;
                         const yearMarkers = getYearMarkers(sopEopMarkerIndex, m.machine_id, y);
                         const monthMarkers =
                           row.kind === 'month'
@@ -3425,7 +3437,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                           row.kind === 'week'
                             ? monthsData?.[row.month]?.weeks[row.week]?.call_off_detail_breakdown
                             : monthsData?.[row.month]?.call_off_detail_breakdown;
-                        const cellTitle = callOffMode
+                        const cellTitle = dualBarsMode
                           ? callOffCellTitle(
                               y,
                               row.month,
@@ -3435,8 +3447,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                               locale,
                               t,
                               volumePeriod,
-                              false,
-                              row.kind === 'month' ? 'weekly' : volumePeriod
+                              false
                             )
                           : periodCellTitle(
                               y,
@@ -3473,7 +3484,6 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                             role={tableCanAllocate ? 'button' : undefined}
                             tabIndex={tableCanAllocate ? 0 : undefined}
                             style={cellStyle}
-                            title={cellTitle}
                             onClick={tableCanAllocate ? openVerticalAllocation : undefined}
                             onKeyDown={
                               tableCanAllocate
@@ -3486,7 +3496,9 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                                 : undefined
                             }
                           >
-                            {renderCapacityCellContent(callOffMode, periodCellPending, pct, coPct, monthMarkers, visualSettings, t)}
+                            <CalcCellHoverTip text={cellTitle}>
+                              {renderCapacityCellContent(dualBarsMode, periodCellPending, pct, coPct, monthMarkers, visualSettings, t)}
+                            </CalcCellHoverTip>
                           </td>
                         );
                       })}
@@ -3511,7 +3523,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                         getTimelineColumnLoad(col, m.years?.[col.year]?.load_percent, monthsData)
                       );
                     }, 0);
-                    const coSum = callOffMode
+                    const coSum = dualBarsMode
                       ? filteredMachines.reduce((acc: number, m: any) => {
                           const monthsData = col.kind === 'year' ? undefined : getMachineMonthsData(m.machine_id, col.year);
                           return (
@@ -3530,13 +3542,13 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                             : `sum-w-${col.year}-${col.month}-${col.week}`
                       }
                       className={col.kind === 'year' ? 'calc-year-col' : 'calc-period-col'}
-                      style={summaryValueCellStyle(Math.round(sum), visualSettings, 'sum', callOffMode)}
+                      style={summaryValueCellStyle(Math.round(sum), visualSettings, 'sum', dualBarsMode)}
                     >
                       {isPeriodColumnPending(col) ? (
                         <span className="calc-period-cell-loading" aria-hidden="true">
                           <span className="data-loading-spinner" />
                         </span>
-                      ) : callOffMode ? (
+                      ) : dualBarsMode ? (
                         <DualLoadCell
                           basePct={sum}
                           callOffPct={coSum}
@@ -3565,7 +3577,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                         getTimelineColumnLoad(col, m.years?.[col.year]?.load_percent, monthsData)
                       );
                     }, 0);
-                    const coSum = callOffMode
+                    const coSum = dualBarsMode
                       ? filteredMachines.reduce((acc: number, m: any) => {
                           const monthsData = col.kind === 'year' ? undefined : getMachineMonthsData(m.machine_id, col.year);
                           return (
@@ -3586,13 +3598,13 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                             : `avg-w-${col.year}-${col.month}-${col.week}`
                       }
                       className={col.kind === 'year' ? 'calc-year-col' : 'calc-period-col'}
-                      style={summaryValueCellStyle(Math.round(avg), visualSettings, 'avg', callOffMode)}
+                      style={summaryValueCellStyle(Math.round(avg), visualSettings, 'avg', dualBarsMode)}
                     >
                       {isPeriodColumnPending(col) ? (
                         <span className="calc-period-cell-loading" aria-hidden="true">
                           <span className="data-loading-spinner" />
                         </span>
-                      ) : callOffMode ? (
+                      ) : dualBarsMode ? (
                         <DualLoadCell
                           basePct={avg}
                           callOffPct={coAvg}
@@ -3620,7 +3632,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                           col.kind === 'year' ? undefined : getMachineMonthsData(m.machine_id, col.year);
                         return getTimelineColumnLoad(col, m.years?.[col.year]?.load_percent, monthsData);
                       }) ?? 0;
-                    const coMaxTypeAvg = callOffMode
+                    const coMaxTypeAvg = dualBarsMode
                       ? maxTypeAverageLoad(filteredMachines, (m: any) => {
                           const monthsData =
                             col.kind === 'year' ? undefined : getMachineMonthsData(m.machine_id, col.year);
@@ -3641,13 +3653,13 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                             : `max-type-avg-w-${col.year}-${col.month}-${col.week}`
                       }
                       className={col.kind === 'year' ? 'calc-year-col' : 'calc-period-col'}
-                      style={summaryValueCellStyle(Math.round(maxTypeAvg), visualSettings, 'maxTypeAvg', callOffMode)}
+                      style={summaryValueCellStyle(Math.round(maxTypeAvg), visualSettings, 'maxTypeAvg', dualBarsMode)}
                     >
                       {isPeriodColumnPending(col) ? (
                         <span className="calc-period-cell-loading" aria-hidden="true">
                           <span className="data-loading-spinner" />
                         </span>
-                      ) : callOffMode ? (
+                      ) : dualBarsMode ? (
                         <DualLoadCell
                           basePct={maxTypeAvg}
                           callOffPct={coMaxTypeAvg}
@@ -4148,7 +4160,9 @@ function AllocationModal({
   const [candidates, setCandidates] = useState<any[]>([]);
   const [operations, setOperations] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
-  const [opId, setOpId] = useState<number | ''>('');
+  /** Klucze grup detali (project:part:phase) — multiwybór. */
+  const [selectedGroupKeys, setSelectedGroupKeys] = useState<string[]>([]);
+  const [opFilterQuery, setOpFilterQuery] = useState('');
   const [targetId, setTargetId] = useState<number | ''>('');
   const [volumeToMove, setVolumeToMove] = useState('');
   const [volumeUnit, setVolumeUnit] = useState<VolumeUnit>('annual');
@@ -4205,6 +4219,13 @@ function AllocationModal({
     return Array.from(map.values()).sort((a, b) => a.representativeId - b.representativeId);
   }, [operations]);
 
+  const selectedGroups = useMemo(
+    () => groupedOperations.filter((g) => selectedGroupKeys.includes(g.key)),
+    [groupedOperations, selectedGroupKeys]
+  );
+  const opId: number | '' = selectedGroups[0]?.representativeId ?? '';
+  const selectedGroupKeySet = useMemo(() => new Set(selectedGroupKeys), [selectedGroupKeys]);
+
   useEffect(() => {
     api.machines.list({ status: 'active' }).then(setAllMachinesList);
   }, []);
@@ -4256,6 +4277,17 @@ function AllocationModal({
   }, [transferMode, valueMode]);
 
   useEffect(() => {
+    setSelectedGroupKeys((prev) => {
+      if (groupedOperations.length === 0) return [];
+      const valid = prev.filter((k) => groupedOperations.some((g) => g.key === k));
+      if (valid.length > 0) return valid;
+      const firstVol = groupedOperations.find((g) => g.totalWeekly > 1e-9);
+      const first = firstVol ?? groupedOperations[0];
+      return first ? [first.key] : [];
+    });
+  }, [groupedOperations]);
+
+  useEffect(() => {
     const o = operations.find((x) => x.id === opId);
     if (!o) return;
     setVolumeUnit((o.effective_volume_unit ?? o.volume_unit ?? 'annual') as 'annual' | 'monthly' | 'weekly');
@@ -4283,25 +4315,6 @@ function AllocationModal({
         setOperations(ops);
         setAlternativesList(Array.isArray(alts) ? alts : []);
         if (srcM?.type != null) setSourceMachineType(String(srcM.type));
-        setOpId((prev) => {
-          if (typeof prev === 'number' && ops.some((o: any) => o.id === prev)) {
-            const keep = ops.find((o: any) => o.id === prev);
-            if (keep && (operationWeekly(keep) > 0 || isZeroVolumePreallocEligible(keep, year, operationWeekly))) {
-              return prev;
-            }
-            if (keep) {
-              const keepKey = operationGroupKey(keep);
-              const sameGroup = ops.filter((o: any) => operationGroupKey(o) === keepKey);
-              const best = sameGroup.sort((a: any, b: any) => operationWeekly(b) - operationWeekly(a))[0];
-              if (best && (operationWeekly(best) > 0 || isZeroVolumePreallocEligible(best, year, operationWeekly))) {
-                return best.id;
-              }
-            }
-          }
-          const firstWithVolume = [...ops].sort((a: any, b: any) => operationWeekly(b) - operationWeekly(a)).find((o: any) => operationWeekly(o) > 0);
-          if (firstWithVolume) return firstWithVolume.id;
-          return ops.length ? ops[0].id : '';
-        });
         setTargetId((prev) => {
           const want = pendingSelectTargetMachineId.current;
           if (want != null && cands.some((c: any) => c.machine_id === want)) {
@@ -4322,10 +4335,10 @@ function AllocationModal({
   }, [loadAllocationData]);
 
   const hintOperationIds = useMemo(() => {
-    if (opId === '') return '';
-    const group = groupedOperations.find((g) => g.representativeId === opId);
-    return group?.operationIds?.length ? group.operationIds.join(',') : String(opId);
-  }, [groupedOperations, opId]);
+    if (selectedGroups.length === 0) return '';
+    const ids = selectedGroups.flatMap((g) => g.operationIds);
+    return ids.length ? ids.join(',') : '';
+  }, [selectedGroups]);
 
   useEffect(() => {
     setLoadHint(null);
@@ -4335,7 +4348,7 @@ function AllocationModal({
   useEffect(() => {
     setLoadHint(null);
     setLoadHintOpIds('');
-  }, [opId]);
+  }, [selectedGroupKeys.join('|')]);
 
   useEffect(() => {
     if (opId === '' || hintOperationIds === '') {
@@ -4381,20 +4394,35 @@ function AllocationModal({
     machineLoadFromCalculator ?? effectiveLoadHint?.current_load_percent ?? null;
 
   const selectedOp = operations.find((o) => o.id === opId);
+  const selectedOps = useMemo(
+    () =>
+      selectedGroups
+        .map((g) => operations.find((o) => o.id === g.representativeId))
+        .filter((o): o is NonNullable<typeof o> => o != null),
+    [selectedGroups, operations]
+  );
   const operationSopEopYears = useMemo(() => {
-    if (!selectedOp) return yearRange;
-    const { years } = sopEopYearsRange(selectedOp.sop ?? '', selectedOp.eop ?? '');
-    if (!years.length) return yearRange;
-    const allowed = new Set(years);
-    return yearRange.filter((y) => allowed.has(y));
-  }, [selectedOp, yearRange]);
+    if (selectedOps.length === 0) return yearRange;
+    const union = new Set<number>();
+    let anySopEop = false;
+    for (const op of selectedOps) {
+      const { years } = sopEopYearsRange(op.sop ?? '', op.eop ?? '');
+      if (!years.length) continue;
+      anySopEop = true;
+      for (const y of years) {
+        if (yearRange.includes(y)) union.add(y);
+      }
+    }
+    if (!anySopEop) return yearRange;
+    return [...union].sort((a, b) => a - b);
+  }, [selectedOps, yearRange]);
 
   useEffect(() => {
-    if (!selectedOp || operationSopEopYears.length === 0) return;
+    if (selectedOps.length === 0 || operationSopEopYears.length === 0) return;
     if (!operationSopEopYears.includes(year)) {
       setYear(operationSopEopYears[0]);
     }
-  }, [selectedOp?.id, operationSopEopYears, year]);
+  }, [selectedGroupKeys.join('|'), operationSopEopYears, year]);
 
   useEffect(() => {
     if (yearMode !== 'multi' || operationSopEopYears.length === 0) return;
@@ -4403,27 +4431,28 @@ function AllocationModal({
       const next = prev.filter((y) => allowed.has(y));
       return next.length > 0 ? next : [...operationSopEopYears];
     });
-  }, [yearMode, operationSopEopYears, selectedOp?.id]);
+  }, [yearMode, operationSopEopYears, selectedGroupKeys.join('|')]);
   const altCycleSeconds = useMemo(() => {
-    const a = Number(selectedOp?.alt_cycle_time_seconds);
-    return Number.isFinite(a) && a > 0 ? a : null;
-  }, [selectedOp]);
+    if (selectedOps.length === 0) return null;
+    const alts = selectedOps.map((o) => Number(o?.alt_cycle_time_seconds));
+    if (alts.some((a) => !Number.isFinite(a) || a <= 0)) return null;
+    return alts[0];
+  }, [selectedOps]);
 
   useEffect(() => {
     setTargetCycleMode('unchanged');
     setCustomCycleSeconds('');
-  }, [opId]);
+  }, [selectedGroupKeys.join('|')]);
 
   useEffect(() => {
     if (targetCycleMode === 'alternative' && altCycleSeconds == null) {
       setTargetCycleMode('unchanged');
     }
   }, [targetCycleMode, altCycleSeconds]);
-  const selectedGroupKey = selectedOp ? operationGroupKey(selectedOp) : '';
-  const selectedGroup = selectedGroupKey ? groupedOperations.find((g) => g.key === selectedGroupKey) : null;
-  const selectedGroupWeekly = selectedGroup?.totalWeekly ?? (selectedOp ? operationWeekly(selectedOp) : 0);
+  const selectedGroupWeekly = selectedGroups.reduce((sum, g) => sum + g.totalWeekly, 0);
   const zeroVolumePreallocForYear =
-    selectedOp != null && isZeroVolumePreallocEligible(selectedOp, year, operationWeekly);
+    selectedOps.length > 0 &&
+    selectedOps.every((op) => isZeroVolumePreallocEligible(op, year, operationWeekly));
   const yearsForAllocation = yearMode === 'single' ? [year] : [...selectedYears].sort((a, b) => a - b);
   const periodAnchorYear = yearsForAllocation[0] ?? year;
   const weeksInStartMonth = getWeekCountInMonth(periodAnchorYear, startMonth);
@@ -4451,7 +4480,7 @@ function AllocationModal({
     if (zeroVolumePreallocForYear && selectedGroupWeekly <= 1e-9) {
       setTransferMode('full');
     }
-  }, [zeroVolumePreallocForYear, selectedGroupWeekly, selectedOp?.id, year]);
+  }, [zeroVolumePreallocForYear, selectedGroupWeekly, selectedGroupKeys.join('|'), year]);
   const workWeeksHint = effectiveLoadHint?.working_weeks_per_year ?? loadHint?.working_weeks_per_year ?? 48;
   const groupWeeklyForYear = yearMaxWeekly[year] ?? selectedGroupWeekly;
 
@@ -4469,7 +4498,7 @@ function AllocationModal({
   );
 
   useEffect(() => {
-    if (!selectedGroupKey || yearsForAllocation.length === 0) {
+    if (selectedGroupKeys.length === 0 || yearsForAllocation.length === 0) {
       setYearMaxWeekly({});
       return;
     }
@@ -4477,7 +4506,7 @@ function AllocationModal({
     Promise.all(
       yearsForAllocation.map(async (y) => {
         const opsForYear = await api.machines.operations(machineId, { year: y, ...allocScenarioParams });
-        const groupOps = (opsForYear || []).filter((o: any) => operationGroupKey(o) === selectedGroupKey);
+        const groupOps = (opsForYear || []).filter((o: any) => selectedGroupKeySet.has(operationGroupKey(o)));
         const maxWeekly = groupOps.reduce((sum: number, o: any) => sum + Math.max(0, operationWeekly(o)), 0);
         return { y, maxWeekly };
       })
@@ -4490,7 +4519,7 @@ function AllocationModal({
     return () => {
       cancelled = true;
     };
-  }, [machineId, selectedGroupKey, yearsForAllocation.join(','), scenarioId, useContractualVolumes]);
+  }, [machineId, selectedGroupKeys.join('|'), yearsForAllocation.join(','), scenarioId, useContractualVolumes]);
 
   const targetPercentCalc = useMemo(() => {
     if (transferMode !== 'targetPercent' || targetPercentHint == null) return null;
@@ -4623,16 +4652,18 @@ function AllocationModal({
       .filter((y, idx, arr) => arr.indexOf(y) === idx)
       .filter((y) => periodFractionForYear(y) > 0)
       .sort((a, b) => a - b);
-    if (!opId || !targetId || yearsToExecute.length === 0) {
+    if (selectedGroupKeys.length === 0 || !targetId || yearsToExecute.length === 0) {
       setMessage({ type: 'err', text: t('calculator.allocation.selectOpMachineYear') });
       return;
     }
-    if (!selectedOp) {
+    if (!selectedOp || selectedGroups.length === 0) {
       setMessage({ type: 'err', text: t('calculator.allocation.operation') });
       return;
     }
     if (transferMode !== 'full' && yearsToExecute.length === 1 && selectedGroupWeekly <= 1e-9) {
-      const zeroPreallocOk = selectedOp && yearsToExecute.every((y) => isZeroVolumePreallocEligible(selectedOp, y, operationWeekly));
+      const zeroPreallocOk =
+        selectedOps.length > 0 &&
+        yearsToExecute.every((y) => selectedOps.every((op) => isZeroVolumePreallocEligible(op, y, operationWeekly)));
       if (!zeroPreallocOk) {
         setMessage({ type: 'err', text: t('calculator.allocation.volumePositive') });
         return;
@@ -4705,7 +4736,7 @@ function AllocationModal({
       const yearData = await Promise.all(
         yearsToExecute.map(async (yearItem) => {
           const opsForYear = await api.machines.operations(machineId, { year: yearItem, ...allocScenarioParams });
-          const groupOps = (opsForYear || []).filter((o: any) => operationGroupKey(o) === selectedGroupKey);
+          const groupOps = (opsForYear || []).filter((o: any) => selectedGroupKeySet.has(operationGroupKey(o)));
           const totalWeeklyRaw = groupOps.reduce((sum: number, o: any) => sum + Math.max(0, operationWeekly(o)), 0);
           const totalWeeklyForYear = totalWeeklyRaw;
           const py = perYearValues[yearItem];
@@ -4721,7 +4752,7 @@ function AllocationModal({
               const groupIds = groupOps.map((o: any) => Number(o.id)).filter((id: number) => Number.isFinite(id) && id > 0);
               const h = await api.allocation.hint(machineId, {
                 year: yearItem,
-                operationId: opId as number,
+                operationId: (opId as number) || groupIds[0],
                 operationIds: groupIds.length ? groupIds.join(',') : String(opId),
                 ...allocScenarioParams,
               });
@@ -4742,7 +4773,12 @@ function AllocationModal({
             });
           }
 
-          const contributors = buildAllocationContributors(groupOps, opId as number, yearItem, operationWeekly);
+          const contributors = buildAllocationContributors(
+            groupOps,
+            (opId as number) || Number(groupOps[0]?.id),
+            yearItem,
+            operationWeekly
+          );
 
           return {
             yearItem,
@@ -5127,13 +5163,18 @@ function AllocationModal({
                   {t('calculator.allocation.clearYears')}
                 </button>
               </div>
-              {selectedOp && operationSopEopYears.length > 0 && (
+              {selectedOps.length > 0 && operationSopEopYears.length > 0 && (
                 <p style={{ margin: '0 0 8px', fontSize: 12, color: '#666' }}>
-                  {t('projectDetailExtra.sopEopYears', {
-                    sop: selectedOp.sop ?? '—',
-                    eop: selectedOp.eop ?? '—',
-                    years: operationSopEopYears.join(', '),
-                  })}
+                  {selectedOps.length === 1
+                    ? t('projectDetailExtra.sopEopYears', {
+                        sop: selectedOps[0].sop ?? '—',
+                        eop: selectedOps[0].eop ?? '—',
+                        years: operationSopEopYears.join(', '),
+                      })
+                    : t('calculator.allocation.sopEopUnion', {
+                        count: selectedOps.length,
+                        years: operationSopEopYears.join(', '),
+                      })}
                 </p>
               )}
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
@@ -5341,29 +5382,113 @@ function AllocationModal({
               <div style={{ borderTop: '1px solid #eee', paddingTop: '1rem', marginTop: '1rem' }}>
                 <h3 style={{ marginTop: 0 }}>{t('calculator.allocation.executeTitle')}</h3>
                 <div style={{ display: 'grid', gap: '0.5rem', marginBottom: 8 }}>
-                  <label>{t('calculator.allocation.operation')}{' '}
-                    <SearchableSelect value={opId} onChange={(e) => setOpId(Number(e.target.value))}>
-                      {groupedOperations.map((g) => {
-                        const ev = Math.round(g.displayValue * 1000) / 1000;
-                        const eu = g.displayUnit as string;
-                        const unitLbl = volumeUnitLabel(eu as VolumeUnit);
-                        const totalWeeklyRounded = Math.round(g.totalWeekly * 1000) / 1000;
-                        return (
-                          <option key={g.key} value={g.representativeId}>
-                            {t('calculator.allocation.operationLine', {
-                              part: g.partDesignation,
-                              phase: g.phaseName,
-                              year,
-                              value: ev,
-                              unit: unitLbl,
-                              weekly: totalWeeklyRounded,
-                              weeklyLabel: t('calculator.allocation.weeklyLabel'),
-                            })}
-                          </option>
-                        );
-                      })}
-                    </SearchableSelect>
-                  </label>
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 6 }}>
+                      <strong>{t('calculator.allocation.operation')}</strong>
+                      <span style={{ fontSize: 12, color: '#666' }}>
+                        {t('calculator.allocation.selectedOpsCount', { count: selectedGroupKeys.length })}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedGroupKeys(groupedOperations.map((g) => g.key))}
+                        style={{ padding: '2px 8px', fontSize: 12 }}
+                      >
+                        {t('common.selectAll')}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedGroupKeys([])}
+                        style={{ padding: '2px 8px', fontSize: 12 }}
+                      >
+                        {t('calculator.allocation.clearYears')}
+                      </button>
+                    </div>
+                    <input
+                      type="search"
+                      value={opFilterQuery}
+                      onChange={(e) => setOpFilterQuery(e.target.value)}
+                      placeholder={t('common.searchFilter')}
+                      style={{
+                        display: 'block',
+                        width: '100%',
+                        boxSizing: 'border-box',
+                        marginBottom: 6,
+                        padding: '6px 8px',
+                        border: '1px solid #cfd8dc',
+                        borderRadius: 4,
+                      }}
+                    />
+                    <div
+                      style={{
+                        maxHeight: 200,
+                        overflow: 'auto',
+                        border: '1px solid #ddd',
+                        borderRadius: 6,
+                        padding: 6,
+                        display: 'grid',
+                        gap: 4,
+                      }}
+                    >
+                      {groupedOperations
+                        .filter((g) => {
+                          const q = opFilterQuery.trim().toLowerCase();
+                          if (!q) return true;
+                          const label = `${g.partDesignation} ${g.phaseName}`.toLowerCase();
+                          return label.includes(q);
+                        })
+                        .map((g) => {
+                          const ev = Math.round(g.displayValue * 1000) / 1000;
+                          const eu = g.displayUnit as string;
+                          const unitLbl = volumeUnitLabel(eu as VolumeUnit);
+                          const totalWeeklyRounded = Math.round(g.totalWeekly * 1000) / 1000;
+                          const checked = selectedGroupKeySet.has(g.key);
+                          return (
+                            <label
+                              key={g.key}
+                              style={{
+                                display: 'flex',
+                                gap: 8,
+                                alignItems: 'flex-start',
+                                padding: '4px 6px',
+                                borderRadius: 4,
+                                background: checked ? '#f1f8e9' : 'transparent',
+                                cursor: 'pointer',
+                                fontSize: 13,
+                              }}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={(e) => {
+                                  if (e.target.checked) {
+                                    setSelectedGroupKeys((prev) =>
+                                      prev.includes(g.key) ? prev : [...prev, g.key]
+                                    );
+                                  } else {
+                                    setSelectedGroupKeys((prev) => prev.filter((k) => k !== g.key));
+                                  }
+                                }}
+                                style={{ marginTop: 3 }}
+                              />
+                              <span>
+                                {t('calculator.allocation.operationLine', {
+                                  part: g.partDesignation,
+                                  phase: g.phaseName,
+                                  year,
+                                  value: ev,
+                                  unit: unitLbl,
+                                  weekly: totalWeeklyRounded,
+                                  weeklyLabel: t('calculator.allocation.weeklyLabel'),
+                                })}
+                              </span>
+                            </label>
+                          );
+                        })}
+                    </div>
+                    <p style={{ margin: '6px 0 0', fontSize: 12, color: '#78909c' }}>
+                      {t('calculator.allocation.multiSelectHelp')}
+                    </p>
+                  </div>
                   {(displayedMachineLoadPercent != null || hintLoading) && (
                     <div style={{ fontSize: 12, color: '#555' }}>
                       {displayedMachineLoadPercent != null

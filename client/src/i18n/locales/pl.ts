@@ -138,7 +138,30 @@ export const pl: TranslationTree = {
     ocuDataTransitionHelp: 'Plik .xlsx — kolumna B = Sonar Part Code, C = ERP, D = Year. W ZIP wraca kopia bez filtrów.',
     ocuDataKatowiceTitle: '2. Katowice_Data',
     ocuDataKatowiceHelp:
-      'Plik .xlsx / .xlsm — arkusz Input. S = Sonar Part Code, E = rok. Wypełniane: X, AB, AC, AD, AE (AE = liczba gniazd). Wynik OCU: .xlsx bez makr, tylko Input.',
+      'Plik .xlsx / .xlsm — arkusz Input. Kolumny odczytu/zapisu ustawisz poniżej (po wczytaniu nagłówków z pliku). Wynik OCU: .xlsx bez makr, tylko Input.',
+    ocuDataKatowicePasswordLabel: 'Hasło otwarcia Katowice_Data (opcjonalne)',
+    ocuDataKatowicePasswordPlaceholder: 'Tylko gdy plik jest zaszyfrowany',
+    ocuDataKatowicePasswordHelp:
+      'Hasła otwarcia nie da się ominąć. Wypełnij to pole dopiero gdy generowanie zgłosi, że plik jest chroniony hasłem.',
+    ocuDataFilePasswordProtected:
+      'Plik Katowice_Data jest zaszyfrowany hasłem otwarcia. Podaj hasło w polu poniżej (nie da się go ominąć bez hasła).',
+    ocuDataFilePasswordWrong: 'Nie udało się odszyfrować pliku — sprawdź hasło otwarcia Katowice_Data.',
+    ocuColMappingTitle: 'Mapowanie kolumn arkusza Input',
+    ocuColMappingHelp:
+      'Nazwy pochodzą z nagłówków pliku. Gdy dodano kolumnę po „Sonar Part Code” (S), użyj „Przesuń o +1 kolumny po S” — litery X/AB/… oraz routing przesuną się w prawo. Mapowanie zapisywane jest w przeglądarce.',
+    ocuColLoadHeaders: 'Wczytaj nagłówki z pliku',
+    ocuColLoadingHeaders: 'Wczytywanie nagłówków…',
+    ocuColShiftAfterS: 'Przesuń o +1 kolumny po S',
+    ocuColResetDefaults: 'Przywróć domyślne litery',
+    ocuColHeadersLoaded: 'Nagłówki z wiersza {{row}} ({{count}} kolumn z nazwą).',
+    ocuColColHeader: 'Kolumna / nagłówek',
+    ocuColColLetter: 'Litera',
+    ocuColColFromFile: 'Nagłówek w pliku',
+    ocuColHeaderMissing: 'Brak nagłówka pod tą literą',
+    ocuColSectionRead: 'Odczyt',
+    ocuColSectionCapacity: 'Zapis Capacity (Opt1cxx)',
+    ocuColSectionRouting: 'Zapis routingu (S1619 / S2102)',
+    ocuDataPreviewFailed: 'Nie udało się wczytać nagłówków z Katowice_Data.',
     ocuDataRoutingTitle: '3. Routing SAP',
     ocuDataRoutingHelp:
       'Plik .txt (Task List Print List). S1619 → AK. S2102: nr materiału → CW/DI, wymiary L×W → DB+DC / DN+DO, Base Qty → CY/DK. Bez S2102: CR–DC / DD–DO = 0 (w tym HL).',
@@ -541,7 +564,8 @@ export const pl: TranslationTree = {
     errScopeRequired: 'Podaj zakres scenariusza (wymagane pole tekstowe).',
     errPickSource: 'Wybierz scenariusz źródłowy.',
     volumeSection: 'Wolumeny produkcyjne',
-    volumeSectionHint: 'Niezależne od punktu wyjścia — określa tylko dane wolumenowe w kalkulatorze scenariusza.',
+    volumeSectionHint:
+      'Niezależne od punktu wyjścia. Po zaznaczeniu kalkulator pokazuje dwa paski: produkcja (scenariusz) u góry i Call offs na dole — jak w widoku Call offs.',
     useCallOffVolumes: 'Użyj wolumenów z Call offs (lista porównań)',
     pickCallOff: '— wybierz porównanie —',
     errPickCallOff: 'Wybierz porównanie Call off z zaimportowanymi wolumenami.',
@@ -574,9 +598,10 @@ export const pl: TranslationTree = {
   },
   calculator: {
     title: 'Kalkulator',
-    scenarioCallOffBanner: 'Wolumeny produkcyjne zastąpione danymi z Call offs: {{name}}',
+    scenarioCallOffBanner:
+      'Porównanie dualne: u góry obciążenie produkcyjne scenariusza, na dole Call offs ({{name}}).',
     scenarioCallOffBannerContract:
-      'Zakres lat z danych Call offs ({{name}}). W trybie kontraktowym wyświetlane są wolumeny kontraktowe ze scenariusza.',
+      'Porównanie dualne: u góry wolumeny kontraktowe scenariusza, na dole Call offs ({{name}}).',
     yearFrom: 'Rok od:',
     yearTo: 'Rok do:',
     machineType: 'Typ maszyny:',
@@ -670,12 +695,16 @@ export const pl: TranslationTree = {
       saveAlt: 'Zapisz alternatywę',
       execute: 'Wykonaj alokację',
       executeTitle: 'Wykonaj alokację',
-      operation: 'Operacja:',
+      operation: 'Operacje (detale):',
       operationLine: '{{part}} – {{phase}} (wolumen {{year}}: {{value}} {{unit}}, suma: {{weekly}} {{weeklyLabel}})',
+      selectedOpsCount: 'zaznaczono {{count}}',
+      multiSelectHelp:
+        'Możesz zaznaczyć kilka detali. Wolumen ręczny / docelowy % dotyczy łącznie wybranych (proporcjonalnie do wolumenu). Tryb „całość” przenosi 100% każdego zaznaczonego.',
+      sopEopUnion: 'Maksymalny okres SOP–EOP dla {{count}} detali: {{years}}',
       weeklyLabel: 'tygodniowo',
       transferModeTitle: 'Sposób przeniesienia wolumenu',
       modeFull: 'Przenieś całość wolumenu detalu',
-      modeFullHelp: 'Przenosi 100% wolumenu wybranego detalu (wszystkie operacje w grupie) w każdym zaznaczonym roku.',
+      modeFullHelp: 'Przenosi 100% wolumenu każdego zaznaczonego detalu (wszystkie operacje w grupie) w każdym zaznaczonym roku.',
       modeFullHelpPartial:
         'Przenosi ułamek wolumenu roku odpowiadający okresowi od wybranego miesiąca/tygodnia do końca roku (kolejne zaznaczone lata — w całości).',
       modeManual: 'Wolumen wpisany ręcznie',
@@ -743,7 +772,7 @@ export const pl: TranslationTree = {
         ' Dla lat {{years}} wolumen został ograniczony — wolumen detalu nie wystarczył, aby osiągnąć docelowe {{percent}}% obciążenia (przeniesiono całość dostępnego wolumenu).',
       allocationCappedManual: ' Dla lat {{years}} wolumen został ograniczony do maksimum dostępnego wolumenu detalu.',
       allocationSkipped: ' Pominięto lata {{years}} (brak możliwego wolumenu przy tym docelowym % lub wolumen 0).',
-      selectOpMachineYear: 'Wybierz operację, maszynę docelową i co najmniej jeden rok.',
+      selectOpMachineYear: 'Wybierz co najmniej jedną operację, maszynę docelową i rok.',
       customCycleRequired: 'Podaj dodatni czas cyklu [s] w opcji „Nowy czas” lub wybierz inną opcję.',
       noAltCycle: 'Ta operacja nie ma zdefiniowanego alternatywnego czasu cyklu.',
     },

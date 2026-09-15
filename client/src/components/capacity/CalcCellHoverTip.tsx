@@ -3,6 +3,8 @@ import { createPortal } from 'react-dom';
 
 type Props = {
   text: string;
+  /** Opcjonalna bogata treść – gdy podana, zastępuje `text` w tooltipie. */
+  richContent?: ReactNode;
   children: ReactNode;
 };
 
@@ -12,7 +14,7 @@ type TipPos = { top: number; left: number; maxHeight: number; width: number };
  * Pełna lista detali przy najechaniu na kafelek obciążenia.
  * Native `title` ucina długie treści; portal + scroll pokazuje wszystkie pozycje.
  */
-export default function CalcCellHoverTip({ text, children }: Props) {
+export default function CalcCellHoverTip({ text, richContent, children }: Props) {
   const tipId = useId();
   const anchorRef = useRef<HTMLDivElement | null>(null);
   const tipRef = useRef<HTMLDivElement | null>(null);
@@ -29,9 +31,9 @@ export default function CalcCellHoverTip({ text, children }: Props) {
 
   const show = useCallback(() => {
     clearHide();
-    if (!text.trim()) return;
+    if (!richContent && !text.trim()) return;
     setOpen(true);
-  }, [text]);
+  }, [text, richContent]);
 
   const scheduleHide = useCallback(() => {
     clearHide();
@@ -103,8 +105,9 @@ export default function CalcCellHoverTip({ text, children }: Props) {
             }}
             onMouseEnter={show}
             onMouseLeave={scheduleHide}
+            onClick={(e) => e.stopPropagation()}
           >
-            {text}
+            {richContent ?? text}
           </div>,
           document.body
         )}

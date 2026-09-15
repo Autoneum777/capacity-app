@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, Fragment, type CSSProperties } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState, Fragment, type CSSProperties } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { useScenarioMode } from '../context/ScenarioModeContext';
 import { useEffectiveCalculationProfile } from '../context/OcuModeContext';
@@ -52,6 +52,7 @@ import {
 } from '../utils/calculatorPeriodExpansion';
 import DualLoadCell from '../components/capacity/DualLoadCell';
 import CalcCellHoverTip from '../components/capacity/CalcCellHoverTip';
+import RfqFilterDropdown from '../components/capacity/RfqFilterDropdown';
 import { loadColor } from '../utils/loadCellColors';
 import { isYearInProjectSopEop, sopEopYearsRange } from '../utils/sopEopFormat';
 import {
@@ -426,6 +427,127 @@ type DetailBreakdownItem = {
   has_rfq?: boolean;
 };
 
+type MaterialBreakdownDetail = {
+  project_label: string;
+  detail_label: string;
+  contribution_percent: number;
+};
+
+type MaterialBreakdownItem = {
+  material_alias: string | null;
+  material_sap: string | null;
+  material_width_mm?: number | null;
+  material_length_mm?: number | null;
+  material_grammage_kg_m2?: number | null;
+  contribution_percent: number;
+  details: MaterialBreakdownDetail[];
+};
+
+/** Etykieta materiału w tooltipie: „Alias (SZERxDŁ mm, gramatura kg/m²)”. */
+function formatMaterialBreakdownLabel(mat: MaterialBreakdownItem, fallbackIndex: number): string {
+  const alias = mat.material_alias ?? mat.material_sap ?? `Materiał ${fallbackIndex + 1}`;
+  const parts: string[] = [];
+  const w = Number(mat.material_width_mm);
+  const l = Number(mat.material_length_mm);
+  if (Number.isFinite(w) && w > 0 && Number.isFinite(l) && l > 0) {
+    parts.push(`${Math.round(w)}×${Math.round(l)} mm`);
+  }
+  const g = Number(mat.material_grammage_kg_m2);
+  if (Number.isFinite(g) && g > 0) {
+    const gText = g >= 1 ? `${Math.round(g * 100) / 100} kg/m²` : `${Math.round(g * 1000)} g/m²`;
+    parts.push(gText);
+  }
+  return parts.length > 0 ? `${alias} (${parts.join(', ')})` : alias;
+}
+
+function BaselineMaterialBreakdownTooltip({
+  items,
+  title,
+}: {
+  items: MaterialBreakdownItem[];
+  title?: string;
+}) {
+  const [expanded, setExpanded] = React.useState<Set<number>>(() => new Set());
+  if (!items.length) {
+    return (
+      <div style={{ fontSize: 13, lineHeight: 1.5 }}>
+        {title && (
+          <div style={{ fontWeight: 600, marginBottom: 4, color: '#1a365d', fontSize: 12 }}>{title}</div>
+        )}
+        <span style={{ whiteSpace: 'pre-wrap' }}>Brak materiałów</span>
+      </div>
+    );
+  }
+  return (
+    <div style={{ fontSize: 13, lineHeight: 1.5 }}>
+      <div style={{ fontWeight: 600, marginBottom: 4, color: '#1a365d', fontSize: 12 }}>
+        {title ?? 'Materiały obciążające linię:'}
+      </div>
+      {items.map((mat, i) => {
+        const label = formatMaterialBreakdownLabel(mat, i);
+        const isOpen = expanded.has(i);
+        return (
+          <div key={i} style={{ marginBottom: 2 }}>
+            <div
+              style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: mat.details.length > 0 ? 'pointer' : 'default', userSelect: 'none' }}
+              onClick={() => {
+                if (mat.details.length === 0) return;
+                setExpanded((prev) => {
+                  const next = new Set(prev);
+                  if (next.has(i)) next.delete(i); else next.add(i);
+                  return next;
+                });
+              }}
+            >
+              {mat.details.length > 0 && (
+                <span style={{ fontSize: 10, color: '#555', minWidth: 10 }}>{isOpen ? '▾' : '▸'}</span>
+              )}
+              <span style={{ fontWeight: 500 }}>{label}</span>
+              <span style={{ color: '#1565c0', marginLeft: 'auto', paddingLeft: 8 }}>
+                {mat.contribution_percent.toFixed(2)}%
+              </span>
+            </div>
+            {isOpen && mat.details.length > 0 && (
+              <div style={{ paddingLeft: 18, borderLeft: '2px solid #dbeafe', marginLeft: 4 }}>
+                {mat.details.map((d, j) => {
+                  const detLabel = d.project_label ? `${d.project_label} · ${d.detail_label}` : d.detail_label;
+                  return (
+                    <div key={j} style={{ display: 'flex', gap: 4, color: '#444', fontSize: 12 }}>
+                      <span style={{ flex: 1 }}>{detLabel}</span>
+                      <span style={{ color: '#1565c0', whiteSpace: 'nowrap' }}>{d.contribution_percent.toFixed(2)}%</span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Tooltip materiałów linii bazowej w widoku Call offs/scenariuszy: wolumeny produkcyjne/kontraktowe + Call offs (SAP). */
+function DualBaselineMaterialBreakdownTooltip({
+  baseItems,
+  callOffItems,
+  baseTitle,
+  callOffTitle,
+}: {
+  baseItems: MaterialBreakdownItem[];
+  callOffItems: MaterialBreakdownItem[];
+  baseTitle: string;
+  callOffTitle: string;
+}) {
+  return (
+    <div>
+      <BaselineMaterialBreakdownTooltip items={baseItems} title={baseTitle} />
+      <div style={{ borderTop: '1px solid #dbeafe', margin: '8px 0' }} />
+      <BaselineMaterialBreakdownTooltip items={callOffItems} title={callOffTitle} />
+    </div>
+  );
+}
+
 function formatDetailBreakdownSection(
   header: string,
   detailBreakdown: DetailBreakdownItem[] | undefined,
@@ -496,6 +618,29 @@ function getTimelineCallOffBreakdown(
   if (!monthsData) return undefined;
   if (col.kind === 'month') return monthsData[col.month]?.call_off_detail_breakdown;
   return monthsData[col.month]?.weeks[col.week]?.call_off_detail_breakdown;
+}
+
+function getTimelineMaterialBreakdown(
+  col: TimelineColumn,
+  cell: { material_breakdown?: MaterialBreakdownItem[] } | undefined,
+  monthsData: Record<number, PeriodMonthData> | undefined
+): MaterialBreakdownItem[] | undefined {
+  if (col.kind === 'year') return cell?.material_breakdown as MaterialBreakdownItem[] | undefined;
+  if (!monthsData) return undefined;
+  if (col.kind === 'month') return monthsData[col.month]?.material_breakdown as MaterialBreakdownItem[] | undefined;
+  return monthsData[col.month]?.weeks[col.week]?.material_breakdown as MaterialBreakdownItem[] | undefined;
+}
+
+function getTimelineCallOffMaterialBreakdown(
+  col: TimelineColumn,
+  cell: { call_off_material_breakdown?: MaterialBreakdownItem[] } | undefined,
+  monthsData: Record<number, PeriodMonthData> | undefined
+): MaterialBreakdownItem[] | undefined {
+  if (col.kind === 'year') return cell?.call_off_material_breakdown as MaterialBreakdownItem[] | undefined;
+  if (!monthsData) return undefined;
+  if (col.kind === 'month')
+    return monthsData[col.month]?.call_off_material_breakdown as MaterialBreakdownItem[] | undefined;
+  return monthsData[col.month]?.weeks[col.week]?.call_off_material_breakdown as MaterialBreakdownItem[] | undefined;
 }
 
 function periodCellTitle(
@@ -962,6 +1107,10 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
   const [calcSortYear, setCalcSortYear] = useState<number | null>(null);
   const [machineStatusFilter, setMachineStatusFilter] = useState<CalculatorMachineStatusFilter[]>(['active']);
   const [groupFilter, setGroupFilter] = useState<number[]>([]);
+  /** Filtr detali RFQ — checkbox aktywny. */
+  const [rfqFilterEnabled, setRfqFilterEnabled] = useState(false);
+  /** Lista zaznaczonych ID operacji RFQ do wliczenia w capacity. */
+  const [rfqSelectedOpIds, setRfqSelectedOpIds] = useState<number[]>([]);
   const [machineGroups, setMachineGroups] = useState<{ id: number; name: string }[]>([]);
   const [yearFrom, setYearFrom] = useState(() => calendarYear() - 1);
   const [yearTo, setYearTo] = useState(() => calendarYear() + 10);
@@ -972,6 +1121,21 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
   const [defaultYearTo, setDefaultYearTo] = useState(() => calendarYear() + 10);
   const yearDefaultsAppliedRef = useRef(false);
   const yearsLockedByCallOffRef = useRef(false);
+  /** Zawsze aktualny zakres domyślny — do resetu po wyjściu z trybu zablokowanego przez Call offs, bez dodawania go do zależności efektów pobierających scenariusz. */
+  const defaultYearRangeRef = useRef({ from: defaultYearFrom, to: defaultYearTo });
+  useEffect(() => {
+    defaultYearRangeRef.current = { from: defaultYearFrom, to: defaultYearTo };
+  }, [defaultYearFrom, defaultYearTo]);
+  /** Po odblokowaniu zakresu (np. wyjście ze scenariusza z Call offs) — wróć do domyślnego zakresu z ustawień. */
+  const resetYearsToDefault = () => {
+    const { from, to } = defaultYearRangeRef.current;
+    yearDefaultsAppliedRef.current = false;
+    setYearFrom(from);
+    setYearTo(to);
+    setDebouncedYearFrom(from);
+    setDebouncedYearTo(to);
+    yearDefaultsAppliedRef.current = true;
+  };
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -1157,11 +1321,16 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
   useEffect(() => {
     if (callOffMode || scenarioId == null || isNaN(scenarioId) || scenarioId <= 0) {
       if (!callOffMode && (scenarioId == null || isNaN(scenarioId) || scenarioId <= 0)) {
+        const wasLocked = yearsLockedByCallOffRef.current;
         setScenarioCallOffComparisonId(null);
         setScenarioCallOffMeta(null);
         setTimelineYearsReady(true);
         if (!callOffMode) {
           yearsLockedByCallOffRef.current = false;
+        }
+        /** Wyjście ze scenariusza z Call offs (2 lata z pliku SAP) na kalkulator produkcyjny — wróć do pełnego domyślnego zakresu. */
+        if (wasLocked) {
+          resetYearsToDefault();
         }
       }
       return;
@@ -1194,9 +1363,14 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
             if (!cancelled) setScenarioCallOffMeta(null);
           }
         } else {
+          const wasLocked = yearsLockedByCallOffRef.current;
           yearsLockedByCallOffRef.current = false;
           setScenarioCallOffComparisonId(null);
           setScenarioCallOffMeta(null);
+          /** Zmiana ze scenariusza z Call offs na scenariusz bez Call offs — wróć do pełnego domyślnego zakresu. */
+          if (wasLocked) {
+            resetYearsToDefault();
+          }
         }
         if (!cancelled) setTimelineYearsReady(true);
       })
@@ -1224,6 +1398,10 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
       if (statuses) params.machineStatuses = statuses;
       if (settingsProfile === 'ocu') params.settingsProfile = 'ocu';
       if (groupFilter.length > 0) params.groupIds = groupFilter.join(',');
+      // RFQ operations included in capacity
+      if (rfqFilterEnabled && rfqSelectedOpIds.length > 0) {
+        params.includeRfqOperationIds = rfqSelectedOpIds.join(',');
+      }
       // Wymiary filtrujemy po stronie klienta (natychmiastowo) — nie wysyłamy ich do API,
       // żeby zmiana progu nie wymagała ponownego przeliczenia obciążenia.
       return params;
@@ -1238,6 +1416,8 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
       scenarioId,
       useContractualVolumes,
       settingsProfile,
+      rfqFilterEnabled,
+      rfqSelectedOpIds,
     ]
   );
 
@@ -1931,6 +2111,8 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
     setAdvancedFiltersOpen(false);
     setMachineStatusFilter(['active']);
     setGroupFilter([]);
+    setRfqFilterEnabled(false);
+    setRfqSelectedOpIds([]);
     setMachinesPage(1);
   };
   const toggleReportMachine = (machineId: number) => {
@@ -2775,6 +2957,13 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
       <div className="calculator-page-header">
         <h1 className="calculator-page-title">
           {callOffMode ? callOffMeta?.name ?? t('callOffs.title') : t('calculator.title')}{' '}
+          {!callOffMode && (
+            <span style={{ fontSize: 16, fontWeight: 400, color: '#666' }}>
+              ({useContractualVolumes
+                ? t('calculator.volumeModeContractual')
+                : t('calculator.volumeModeProduction')})
+            </span>
+          )}
           {callOffMode ? (
             <span style={{ fontSize: 16, fontWeight: 400, color: '#666' }}>
               ({t('callOffs.dualLegend')})
@@ -2892,6 +3081,14 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
           {t('calculator.machineGroups')}{' '}
           <MachineGroupsMultiFilter className="cap-filter-select" groups={machineGroups} selected={groupFilter} onChange={setGroupFilter} />
         </label>
+        {!callOffMode && (
+          <RfqFilterDropdown
+            enabled={rfqFilterEnabled}
+            onEnabledChange={setRfqFilterEnabled}
+            selectedOpIds={rfqSelectedOpIds}
+            onSelectedOpIdsChange={setRfqSelectedOpIds}
+          />
+        )}
         <div className="filter-actions">
           <DataLoadingBadge
             active={calculatorBusy}
@@ -3245,21 +3442,31 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                     : undefined;
                   const volumePeriod = dualBarsMode && isYearCell ? 'monthly' : timelineVolumePeriod(col);
                   const canAllocPeriod = tableCanAllocate;
+                  const isBaselineMachine = Boolean(m.is_baseline);
+                  const matBreakdownRaw: MaterialBreakdownItem[] | undefined = !isBaselineMachine
+                    ? undefined
+                    : getTimelineMaterialBreakdown(col, cell, monthsData);
+                  const callOffMatBreakdownRaw: MaterialBreakdownItem[] | undefined =
+                    !isBaselineMachine || !dualBarsMode
+                      ? undefined
+                      : getTimelineCallOffMaterialBreakdown(col, cell, monthsData);
                   const cellTitle = dualBarsMode
-                    ? callOffCellTitle(
-                        yearForCell,
-                        monthNum,
-                        weekNum,
-                        baseBreakdown,
-                        callOffBreakdown,
-                        locale,
-                        t,
-                        volumePeriod,
-                        tableCanAllocate && isYearCell
-                      )
+                    ? (isBaselineMachine
+                        ? ''
+                        : callOffCellTitle(
+                            yearForCell,
+                            monthNum,
+                            weekNum,
+                            baseBreakdown,
+                            callOffBreakdown,
+                            locale,
+                            t,
+                            volumePeriod,
+                            tableCanAllocate && isYearCell
+                          ))
                     : isYearCell
-                      ? percentCellTitle(yearForCell, altB, baseBreakdown, locale, t, tableCanAllocate)
-                      : periodCellTitle(
+                      ? (isBaselineMachine ? '' : percentCellTitle(yearForCell, altB, baseBreakdown, locale, t, tableCanAllocate))
+                      : (isBaselineMachine ? '' : periodCellTitle(
                           yearForCell,
                           monthNum,
                           weekNum,
@@ -3268,7 +3475,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                           t,
                           volumePeriod,
                           canAllocPeriod
-                        );
+                        ));
                   const openAllocation = () => {
                     if (!canAllocPeriod && !(tableCanAllocate && isYearCell)) return;
                     setAllocationModal({
@@ -3325,7 +3532,23 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                           : undefined
                       }
                     >
-                      <CalcCellHoverTip text={cellTitle}>
+                      <CalcCellHoverTip
+                        text={cellTitle}
+                        richContent={
+                          dualBarsMode && isBaselineMachine
+                            ? (
+                                <DualBaselineMaterialBreakdownTooltip
+                                  baseItems={matBreakdownRaw ?? []}
+                                  callOffItems={callOffMatBreakdownRaw ?? []}
+                                  baseTitle={t('callOffs.tooltipBaseSection')}
+                                  callOffTitle={t('callOffs.tooltipSapSection')}
+                                />
+                              )
+                            : matBreakdownRaw
+                              ? <BaselineMaterialBreakdownTooltip items={matBreakdownRaw} />
+                              : undefined
+                        }
+                      >
                         {renderCapacityCellContent(dualBarsMode, periodCellPending, pct, coPct, monthMarkers, visualSettings, t)}
                         {visualSettings.show_rfq_badge && isYearCell && cell?.has_rfq && (
                           <span
@@ -3376,14 +3599,16 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                   >
                     {t('calculator.transferVolume')}
                   </button>
-                  {canViewMachineDetails ? (
-                    <Link to={`/maszyny/${m.machine_id}`} className="calc-action-btn calc-action-btn--blue">
-                      {t('common.details')}
-                    </Link>
-                  ) : (
-                    <span className="calc-action-btn calc-action-btn--disabled" title={t('auth.forbidden')}>
-                      {t('common.details')}
-                    </span>
+                  {!scenarioActive && (
+                    canViewMachineDetails ? (
+                      <Link to={`/maszyny/${m.machine_id}`} className="calc-action-btn calc-action-btn--blue">
+                        {t('common.details')}
+                      </Link>
+                    ) : (
+                      <span className="calc-action-btn calc-action-btn--disabled" title={t('auth.forbidden')}>
+                        {t('common.details')}
+                      </span>
+                    )
                   )}
                   </div>
                 </td>
@@ -3437,28 +3662,46 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                           row.kind === 'week'
                             ? monthsData?.[row.month]?.weeks[row.week]?.call_off_detail_breakdown
                             : monthsData?.[row.month]?.call_off_detail_breakdown;
+                        const isBaselineMachineVert = Boolean(m.is_baseline);
+                        const vertMatBreakdownRaw: MaterialBreakdownItem[] | undefined = !isBaselineMachineVert
+                          ? undefined
+                          : ((row.kind === 'week'
+                              ? monthsData?.[row.month]?.weeks[row.week]?.material_breakdown
+                              : monthsData?.[row.month]?.material_breakdown) as MaterialBreakdownItem[] | undefined);
+                        const vertCallOffMatBreakdownRaw: MaterialBreakdownItem[] | undefined =
+                          !isBaselineMachineVert || !dualBarsMode
+                            ? undefined
+                            : ((row.kind === 'week'
+                                ? monthsData?.[row.month]?.weeks[row.week]?.call_off_material_breakdown
+                                : monthsData?.[row.month]?.call_off_material_breakdown) as
+                                | MaterialBreakdownItem[]
+                                | undefined);
                         const cellTitle = dualBarsMode
-                          ? callOffCellTitle(
-                              y,
-                              row.month,
-                              row.kind === 'week' ? row.week : undefined,
-                              baseBreakdown,
-                              callOffBreakdown,
-                              locale,
-                              t,
-                              volumePeriod,
-                              false
-                            )
-                          : periodCellTitle(
-                              y,
-                              row.month,
-                              row.kind === 'week' ? row.week : undefined,
-                              baseBreakdown,
-                              locale,
-                              t,
-                              volumePeriod,
-                              tableCanAllocate
-                            );
+                          ? (isBaselineMachineVert
+                              ? ''
+                              : callOffCellTitle(
+                                  y,
+                                  row.month,
+                                  row.kind === 'week' ? row.week : undefined,
+                                  baseBreakdown,
+                                  callOffBreakdown,
+                                  locale,
+                                  t,
+                                  volumePeriod,
+                                  false
+                                ))
+                          : (isBaselineMachineVert
+                              ? ''
+                              : periodCellTitle(
+                                  y,
+                                  row.month,
+                                  row.kind === 'week' ? row.week : undefined,
+                                  baseBreakdown,
+                                  locale,
+                                  t,
+                                  volumePeriod,
+                                  tableCanAllocate
+                                ));
                         const openVerticalAllocation = () => {
                           if (!tableCanAllocate) return;
                           setAllocationModal({
@@ -3496,7 +3739,23 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
                                 : undefined
                             }
                           >
-                            <CalcCellHoverTip text={cellTitle}>
+                            <CalcCellHoverTip
+                              text={cellTitle}
+                              richContent={
+                                dualBarsMode && isBaselineMachineVert
+                                  ? (
+                                      <DualBaselineMaterialBreakdownTooltip
+                                        baseItems={vertMatBreakdownRaw ?? []}
+                                        callOffItems={vertCallOffMatBreakdownRaw ?? []}
+                                        baseTitle={t('callOffs.tooltipBaseSection')}
+                                        callOffTitle={t('callOffs.tooltipSapSection')}
+                                      />
+                                    )
+                                  : vertMatBreakdownRaw
+                                    ? <BaselineMaterialBreakdownTooltip items={vertMatBreakdownRaw} />
+                                    : undefined
+                              }
+                            >
                               {renderCapacityCellContent(dualBarsMode, periodCellPending, pct, coPct, monthMarkers, visualSettings, t)}
                             </CalcCellHoverTip>
                           </td>

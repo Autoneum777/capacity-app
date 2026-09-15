@@ -13,6 +13,10 @@ export type SapRoutingComponent = {
   /** Kod typu z opisu, np. S2102 / S1619 */
   code: string;
   description: string;
+  /** Wersja BOM z linii „Alt. N” (1 = podstawowa). */
+  bomAlt: number | null;
+  /** Zużycie komponentu na jedną sztukę detalu (Qty z eksportu SAP / 1000). */
+  bomQuantityPerDetail: number | null;
   /** Pole powierzchni z wymiarów L×W w opisie (jeśli da się odczytać). */
   area: number | null;
   /** Długość [mm] z opisu (pierwszy wymiar). */
@@ -21,9 +25,42 @@ export type SapRoutingComponent = {
   width: number | null;
 };
 
+/** Tylko podstawowa wersja BOM (Alt. 1). Brak znacznika traktujemy jak Alt. 1. */
+export function isPrimaryBomAlt(alt: number | null | undefined): boolean {
+  return alt == null || alt === 1;
+}
+
+function peekBomMeta(
+  lines: string[],
+  fromIndex: number
+): { alt: number | null; quantityPerDetail: number | null } {
+  const bomAltRe = /\bAlt\.\s*(\d+)\b/i;
+  const qtyRe = /\bQty\s+([\d.,]+)/i;
+  const stopRe = /^\s*(Material\s+\d+|Mat\.\s*Comp\.|Sequence|Operation)\b/i;
+  const limit = Math.min(lines.length, fromIndex + 8);
+  for (let i = fromIndex; i < limit; i++) {
+    const line = lines[i].replace(/\u00a0/g, ' ');
+    if (i > fromIndex && stopRe.test(line)) break;
+    const altMatch = bomAltRe.exec(line);
+    if (altMatch) {
+      const alt = Number(altMatch[1]);
+      const rawQuantity = qtyRe.exec(line);
+      const parsedQuantity = rawQuantity ? parseEuNumber(rawQuantity[1]) : null;
+      return {
+        alt: Number.isFinite(alt) ? alt : null,
+        quantityPerDetail:
+          parsedQuantity != null && parsedQuantity >= 0 ? parsedQuantity / 1000 : null,
+      };
+    }
+  }
+  return { alt: null, quantityPerDetail: null };
+}
+
 export type SapRoutingIndex = {
   /** Wyrób SAP → unikalne komponenty (kolejność pierwszego wystąpienia). */
   byFinishedGood: Map<string, SapRoutingComponent[]>;
+  /** Materiały mające operację „Produkcja HL” na stanowisku B03-002. */
+  capacityMaterials: Set<string>;
   /**
    * Base Qty z pierwszej operacji bloku Material (klucz = numer materiału).
    * Używane dla S2102 → kolumny CY / DK.
@@ -74,12 +111,14 @@ export function parseFormatkaArea(description: string): number | null {
 /**
  * Parsuje tekst routingu SAP.
  * Dla każdego wyrobu zbiera komponenty; duplikaty (ten sam Mat. Comp. + kod) są pomijane.
+ * Komponenty z BOM Alt. 2 i wyżej są pomijane (zostaje tylko Alt. 1).
  * Base Qty zbierane z operacji każdego bloku Material.
  */
 export function parseSapRoutingText(text: string): SapRoutingIndex {
   const lines = String(text ?? '').split(/\r?\n/);
   const byFinishedGood = new Map<string, SapRoutingComponent[]>();
   const baseQtyByMaterial = new Map<string, number>();
+  const capacityMaterials = new Set<string>();
   const seenInFg = new Map<string, Set<string>>();
 
   let currentFg: string | null = null;
@@ -89,9 +128,11 @@ export function parseSapRoutingText(text: string): SapRoutingIndex {
   const materialRe = /^Material\s+(\d+)\b/i;
   const compRe = /^\s*Mat\.\s*Comp\.\s+(\d+)\s+(\S+)\s*(.*)$/i;
   const baseQtyRe = /^\s*Base\s+Qty\s+([\d.,]+)/i;
+  const operationRe =
+    /^\s*Operation\b.*\bWork\s+Ctr\s+B03-002\b.*\bProdukcja\s+HL\b/i;
 
-  for (const raw of lines) {
-    const line = raw.replace(/\u00a0/g, ' ');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].replace(/\u00a0/g, ' ');
     const mat = materialRe.exec(line);
     if (mat) {
       currentFg = normSap(mat[1]);
@@ -104,6 +145,8 @@ export function parseSapRoutingText(text: string): SapRoutingIndex {
     }
 
     if (!currentFg) continue;
+
+    if (operationRe.test(line)) capacityMaterials.add(currentFg);
 
     const bq = baseQtyRe.exec(line);
     if (bq && !baseQtyByMaterial.has(currentFg)) {
@@ -122,6 +165,10 @@ export function parseSapRoutingText(text: string): SapRoutingIndex {
     const description = String(cm[3] ?? '').trim();
     if (!materialNumber || !code) continue;
 
+    const bomMeta = peekBomMeta(lines, i + 1);
+    const bomAlt = bomMeta.alt;
+    if (!isPrimaryBomAlt(bomAlt)) continue;
+
     const dedupeKey = `${materialNumber}|${code}`;
     const seen = seenInFg.get(currentFg)!;
     if (seen.has(dedupeKey)) continue;
@@ -132,6 +179,8 @@ export function parseSapRoutingText(text: string): SapRoutingIndex {
       materialNumber,
       code,
       description,
+      bomAlt: bomAlt ?? 1,
+      bomQuantityPerDetail: bomMeta.quantityPerDetail,
       area: dims?.area ?? null,
       length: dims?.length ?? null,
       width: dims?.width ?? null,
@@ -142,7 +191,7 @@ export function parseSapRoutingText(text: string): SapRoutingIndex {
     throw new Error('Routing SAP: nie znaleziono żadnego nagłówka „Material …”.');
   }
 
-  return { byFinishedGood, baseQtyByMaterial, finishedGoods, componentRows };
+  return { byFinishedGood, baseQtyByMaterial, capacityMaterials, finishedGoods, componentRows };
 }
 
 export function parseSapRoutingBuffer(buffer: Buffer): SapRoutingIndex {
@@ -203,6 +252,65 @@ export function componentsWithCodeDeep(
       if (!child || visited.has(child) || !index.byFinishedGood.has(child)) continue;
       visited.add(child);
       queue.push({ sap: child, depth: depth + 1 });
+    }
+  }
+
+  return found;
+}
+
+/**
+ * Komponenty o danym kodzie: bezpośrednio pod wyrobem oraz wewnątrz wskazanych
+ * półproduktów (np. C21Q1), o ile ich bloki Material są w tym samym pliku.
+ * W odróżnieniu od componentsWithCodeDeep nie schodzi przez pozostałe kody,
+ * więc nie wciąga materiałów z niepowiązanych gałęzi BOM ani z zagnieżdżonych
+ * bloków samego szukanego materiału.
+ */
+export function componentsWithCodeViaSubassemblies(
+  index: SapRoutingIndex,
+  finishedGoodSap: string,
+  codePrefix: string,
+  subassemblyPrefixes: string[],
+  maxDepth = 4
+): SapRoutingComponent[] {
+  const root = normSap(finishedGoodSap);
+  const prefix = codePrefix.trim().toUpperCase();
+  if (!root || !prefix) return [];
+  const subPrefixes = subassemblyPrefixes
+    .map((p) => String(p ?? '').trim().toUpperCase())
+    .filter(Boolean);
+
+  const found: SapRoutingComponent[] = [];
+  const foundKeys = new Set<string>();
+  const visited = new Set<string>([root]);
+  const queue: { sap: string; depth: number; quantityFactor: number }[] = [
+    { sap: root, depth: 0, quantityFactor: 1 },
+  ];
+
+  while (queue.length) {
+    const { sap, depth, quantityFactor } = queue.shift()!;
+    for (const c of index.byFinishedGood.get(sap) ?? []) {
+      if (c.code === prefix || c.code.startsWith(prefix)) {
+        const key = `${c.materialNumber}|${c.code}`;
+        if (!foundKeys.has(key)) {
+          foundKeys.add(key);
+          found.push({
+            ...c,
+            bomQuantityPerDetail:
+              (c.bomQuantityPerDetail ?? 1) * quantityFactor,
+          });
+        }
+        continue;
+      }
+      if (depth + 1 >= maxDepth) continue;
+      if (!subPrefixes.some((p) => c.code === p || c.code.startsWith(p))) continue;
+      const child = normSap(c.materialNumber);
+      if (!child || visited.has(child) || !index.byFinishedGood.has(child)) continue;
+      visited.add(child);
+      queue.push({
+        sap: child,
+        depth: depth + 1,
+        quantityFactor: quantityFactor * (c.bomQuantityPerDetail ?? 1),
+      });
     }
   }
 

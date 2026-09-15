@@ -256,6 +256,92 @@ function syncVolumesToSopEop(projectId: number, sop: string, eop: string): void 
   syncPartVolumesToSopEop(projectId, sop, eop);
 }
 
+/**
+ * Drzewo projektów RFQ z detalami i operacjami — do filtra "Pokaż detale RFQ" w kalkulatorze.
+ * Struktura: klienci → projekty → detale → operacje (maszyny).
+ */
+projectsRouter.get('/rfq-filter-tree', (req, res) => {
+  const refMode = referenceModeFromReq(req);
+  const rows = db.prepare(`
+    SELECT p.id AS project_id, p.name AS project_name, p.client,
+           pt.id AS part_id,
+           pd.designation, pd.sap_number, pd.alias, pd.free_text, pt.designation_id,
+           o.id AS operation_id,
+           m.id AS machine_id, m.internal_number, m.sap_number AS machine_sap, m.location
+    FROM projects p
+    JOIN parts pt ON pt.project_id = p.id
+    JOIN operations o ON o.part_id = pt.id
+    JOIN machines m ON m.id = o.machine_id
+    LEFT JOIN part_designations pd ON pd.id = pt.designation_id
+    WHERE p.status = 'RFQ'
+    ORDER BY p.client, p.name, pt.id, o.id
+  `).all() as any[];
+
+  // Grupowanie: klient → projekt → detal → operacje
+  const clientMap = new Map<string, {
+    client: string;
+    projects: Map<number, {
+      id: number;
+      name: string;
+      parts: Map<number, {
+        id: number;
+        label: string;
+        operations: { id: number; label: string; machine_id: number; location: string | null }[];
+      }>;
+    }>;
+  }>();
+
+  for (const row of rows) {
+    const client = String(row.client ?? '').trim();
+    if (!clientMap.has(client)) clientMap.set(client, { client, projects: new Map() });
+    const clientEntry = clientMap.get(client)!;
+
+    if (!clientEntry.projects.has(row.project_id)) {
+      clientEntry.projects.set(row.project_id, { id: row.project_id, name: String(row.project_name ?? ''), parts: new Map() });
+    }
+    const proj = clientEntry.projects.get(row.project_id)!;
+
+    if (!proj.parts.has(row.part_id)) {
+      const detailLabel = formatDetailSapAliasLabel(
+        { sap_number: row.sap_number, alias: row.alias, free_text: row.free_text, designation: row.designation, id: row.part_id },
+        refMode
+      );
+      proj.parts.set(row.part_id, { id: row.part_id, label: detailLabel, operations: [] });
+    }
+    const part = proj.parts.get(row.part_id)!;
+
+    const machineSap = String(row.machine_sap ?? '').trim();
+    const machineInternal = row.internal_number != null ? String(row.internal_number).trim() : '';
+    const machineLabel = machineSap && machineInternal
+      ? `${machineSap} (${machineInternal})`
+      : machineSap || machineInternal || `M${row.machine_id}`;
+
+    if (!part.operations.find((o) => o.id === row.operation_id)) {
+      part.operations.push({
+        id: Number(row.operation_id),
+        label: machineLabel,
+        machine_id: Number(row.machine_id),
+        location: row.location != null ? String(row.location) : null,
+      });
+    }
+  }
+
+  res.json({
+    clients: Array.from(clientMap.values()).map((c) => ({
+      client: c.client,
+      projects: Array.from(c.projects.values()).map((p) => ({
+        id: p.id,
+        name: p.name,
+        parts: Array.from(p.parts.values()).map((pt) => ({
+          id: pt.id,
+          label: pt.label,
+          operations: pt.operations,
+        })),
+      })),
+    })),
+  });
+});
+
 projectsRouter.get('/', (req, res) => {
   const statuses = parseMachineStatusList(req.query.status, req.query.statuses);
   const clients = parseClientFilterQuery(req.query.client, req.query.clients);

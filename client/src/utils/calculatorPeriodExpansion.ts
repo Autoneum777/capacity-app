@@ -8,12 +8,16 @@ export type PeriodMonthData = {
       call_off_load_percent?: number;
       detail_breakdown?: DetailBreakdownEntry[];
       call_off_detail_breakdown?: DetailBreakdownEntry[];
+      material_breakdown?: MaterialBreakdownEntry[];
+      call_off_material_breakdown?: MaterialBreakdownEntry[];
     }
   >;
   has_sop?: boolean;
   has_eop?: boolean;
   detail_breakdown?: DetailBreakdownEntry[];
   call_off_detail_breakdown?: DetailBreakdownEntry[];
+  material_breakdown?: MaterialBreakdownEntry[];
+  call_off_material_breakdown?: MaterialBreakdownEntry[];
 };
 
 export type DetailBreakdownEntry = {
@@ -23,6 +27,16 @@ export type DetailBreakdownEntry = {
   share_percent?: number;
   volume_quantity?: number;
   has_rfq?: boolean;
+};
+
+export type MaterialBreakdownEntry = {
+  material_alias: string | null;
+  material_sap: string | null;
+  material_width_mm?: number | null;
+  material_length_mm?: number | null;
+  material_grammage_kg_m2?: number | null;
+  contribution_percent: number;
+  details: { project_label: string; detail_label: string; contribution_percent: number }[];
 };
 
 export type PeriodBreakdownMachine = {

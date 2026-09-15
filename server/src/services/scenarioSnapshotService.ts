@@ -402,6 +402,7 @@ export function hydrateOperationsForScenario(snapshot: ScenarioBundle): any[] {
       detail_sap_number: pd?.sap_number ?? null,
       detail_alias: pd?.alias ?? null,
       detail_free_text: pd?.free_text ?? null,
+      detail_designation_id: pd?.id ?? pt?.designation_id ?? null,
       detail_designation: pt?.designation ?? null,
     };
   });

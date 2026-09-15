@@ -362,6 +362,7 @@ export const de: TranslationTree = {
     sapRequired: 'SAP-Nummer *',
     internalPlaceholder: 'z. B. 1134 oder 1134/1',
     typeRequired: 'Typ *',
+    baselineMachine: 'Basislinie',
     lineRequired: 'Liniennr. *',
     digitsOnly: 'nur Ziffern',
     machineUsage: 'Machine usage (0..1)',
@@ -596,6 +597,8 @@ export const de: TranslationTree = {
   },
   calculator: {
     title: 'Kalkulator',
+    volumeModeProduction: 'Produktionsvolumen',
+    volumeModeContractual: 'Vertragsvolumen',
     scenarioCallOffBanner:
       'Dual-Vergleich: Szenario-Produktionsauslastung oben, Call offs ({{name}}) unten.',
     scenarioCallOffBannerContract:

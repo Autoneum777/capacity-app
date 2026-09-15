@@ -37,7 +37,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const init: RequestInit = { cache: 'no-store', credentials: 'include', ...options };
   const headers = new Headers(init.headers as HeadersInit | undefined);
   const hasBody = init.body != null && init.body !== '';
-  if (hasBody && !headers.has('Content-Type')) {
+  if (hasBody && !(init.body instanceof FormData) && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
   }
   init.headers = headers;
@@ -883,6 +883,47 @@ export const api = {
     import: (machines: any[]) => request<{ created: number; skipped: number; errors: string[]; createdNumbers: number[]; skippedNumbers: number[] }>('/machines/import', { method: 'POST', body: JSON.stringify({ machines }) }),
     update: (id: number, body: any) => request<any>(`/machines/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
     delete: (id: number) => request<void>(`/machines/${id}`, { method: 'DELETE' }),
+    materials: {
+      list: (machineId: number) => request<any[]>(`/machines/${machineId}/materials`),
+      designations: (machineId: number) => request<any[]>(`/machines/${machineId}/material-designations`),
+      importRouting: (
+        machineId: number,
+        file: File
+      ) => {
+        const body = new FormData();
+        body.append('file', file);
+        return request<{
+          routing_finished_goods: number;
+          matched_details: number;
+          unmatched_details: number;
+          materials_created: number;
+          materials_updated: number;
+          links_created: number;
+        }>(`/machines/${machineId}/materials/import-routing`, { method: 'POST', body });
+      },
+      create: (machineId: number, body: any) =>
+        request<any>(`/machines/${machineId}/materials`, { method: 'POST', body: JSON.stringify(body) }),
+      update: (machineId: number, materialId: number, body: any) =>
+        request<any>(`/machines/${machineId}/materials/${materialId}`, { method: 'PUT', body: JSON.stringify(body) }),
+      delete: (machineId: number, materialId: number) =>
+        request<void>(`/machines/${machineId}/materials/${materialId}`, { method: 'DELETE' }),
+      bulkDelete: (machineId: number, body: { all?: boolean; ids?: number[] }) =>
+        request<{ deleted: number }>(`/machines/${machineId}/materials/bulk-delete`, {
+          method: 'POST',
+          body: JSON.stringify(body),
+        }),
+      externalVolumes: {
+        list: (machineId: number, materialId: number) =>
+          request<{ year: number; weekly_volume: number }[]>(
+            `/machines/${machineId}/materials/${materialId}/external-volumes`
+          ),
+        save: (machineId: number, materialId: number, rows: { year: number; weekly_volume: number }[]) =>
+          request<{ year: number; weekly_volume: number }[]>(
+            `/machines/${machineId}/materials/${materialId}/external-volumes`,
+            { method: 'PUT', body: JSON.stringify(rows) }
+          ),
+      },
+    },
   },
   machineGroups: {
     list: () =>
@@ -1498,6 +1539,32 @@ export const api = {
     patchProjectStatus: (scenarioId: number, projectId: number, body: { status: 'active' | 'inactive' | 'RFQ' }) =>
       request<{ id: number; status: string; unchanged?: boolean }>(`/scenarios/${scenarioId}/projects/${projectId}`, {
         method: 'PATCH',
+        body: JSON.stringify(body),
+      }),
+    /** Zmiana SOP/EOP projektu — tylko w scenariuszu, bez wpływu na produkcję. */
+    patchProjectSopEop: (scenarioId: number, projectId: number, body: { sop?: string; eop?: string }) =>
+      request<{ id: number; status: string; sop: string | null; eop: string | null; unchanged?: boolean }>(
+        `/scenarios/${scenarioId}/projects/${projectId}`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify(body),
+        }
+      ),
+    /** Wolumen detalu (roczne wartości) — tylko w scenariuszu, bez wpływu na produkcję. */
+    putPartVolumes: (
+      scenarioId: number,
+      partId: number,
+      body:
+        | { mode: 'override'; volumes: { year: number; volume_value: number; volume_unit: 'annual' | 'monthly' | 'weekly' }[] }
+        | { mode: 'project' }
+    ) =>
+      request<{
+        id: number;
+        volume_mode: string;
+        volumes: { part_id: number; year: number; volume_value: number; volume_unit: string; volume_origin?: string }[];
+        unchanged?: boolean;
+      }>(`/scenarios/${scenarioId}/parts/${partId}/volumes`, {
+        method: 'PUT',
         body: JSON.stringify(body),
       }),
     patchPartStatus: (scenarioId: number, partId: number, body: { status: 'active' | 'inactive' | 'RFQ' | null }) =>

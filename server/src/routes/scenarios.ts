@@ -131,7 +131,7 @@ scenariosRouter.post('/:id/projects', (_req, res) => {
   res.status(403).json({ error: 'Nowe projekty i detale tworzy się tylko w wersji Capacity (produkcja). Użyj Projekty w trybie Wersja Capacity.' });
 });
 
-/** Zmiana statusu projektu w snapshotcie scenariusza (nie zmienia produkcji). */
+/** Zmiana statusu / dat SOP-EOP projektu w snapshotcie scenariusza (nie zmienia produkcji). */
 scenariosRouter.patch('/:id/projects/:projectId', (req, res) => {
   const id = Number(req.params.id);
   const projectId = Number(req.params.projectId);
@@ -141,26 +141,59 @@ scenariosRouter.patch('/:id/projects/:projectId', (req, res) => {
     | undefined;
   if (!row) return res.status(404).json({ error: 'Not found' });
   if (row.archived_at != null && String(row.archived_at).trim() !== '') {
-    return res.status(400).json({ error: 'Scenariusz zarchiwizowany — edycja statusów jest wyłączona.' });
+    return res.status(400).json({ error: 'Scenariusz zarchiwizowany — edycja jest wyłączona.' });
   }
-  const statusRaw = String((req.body as any)?.status ?? '').trim();
-  const status = ['active', 'inactive', 'RFQ'].includes(statusRaw) ? statusRaw : null;
-  if (!status) return res.status(400).json({ error: 'Podaj status: active, inactive lub RFQ.' });
+  const body = (req.body ?? {}) as { status?: unknown; sop?: unknown; eop?: unknown };
+  const hasStatus = Object.prototype.hasOwnProperty.call(body, 'status');
+  const hasSop = Object.prototype.hasOwnProperty.call(body, 'sop');
+  const hasEop = Object.prototype.hasOwnProperty.call(body, 'eop');
+  if (!hasStatus && !hasSop && !hasEop) {
+    return res.status(400).json({ error: 'Podaj status, sop lub eop.' });
+  }
+  let status: string | null = null;
+  if (hasStatus) {
+    const statusRaw = String(body.status ?? '').trim();
+    status = ['active', 'inactive', 'RFQ'].includes(statusRaw) ? statusRaw : null;
+    if (!status) return res.status(400).json({ error: 'Podaj status: active, inactive lub RFQ.' });
+  }
+  const sop = hasSop ? String(body.sop ?? '').trim() : null;
+  const eop = hasEop ? String(body.eop ?? '').trim() : null;
   try {
     const bundle = parseScenarioSnapshotJson(row.snapshot);
     const projects = bundle.projects || [];
     const idx = projects.findIndex((p: any) => Number(p.id) === projectId);
     if (idx < 0) return res.status(404).json({ error: 'Projekt nie występuje w tym scenariuszu.' });
-    const prev = String((projects[idx] as any).status ?? 'active');
-    if (prev === status) {
-      return res.json({ id: projectId, status, unchanged: true });
+    const proj = projects[idx] as any;
+    const changes: string[] = [];
+    if (hasStatus && status != null) {
+      const prev = String(proj.status ?? 'active');
+      if (prev !== status) {
+        proj.status = status;
+        changes.push(`status: „${prev}” → „${status}”`);
+      }
     }
-    (projects[idx] as any).status = status;
+    if (hasSop) {
+      const prev = String(proj.sop ?? '');
+      if (prev !== sop) {
+        proj.sop = sop;
+        changes.push(`SOP: „${prev || '—'}” → „${sop || '—'}”`);
+      }
+    }
+    if (hasEop) {
+      const prev = String(proj.eop ?? '');
+      if (prev !== eop) {
+        proj.eop = eop;
+        changes.push(`EOP: „${prev || '—'}” → „${eop || '—'}”`);
+      }
+    }
+    if (changes.length === 0) {
+      return res.json({ id: projectId, status: proj.status ?? 'active', sop: proj.sop ?? null, eop: proj.eop ?? null, unchanged: true });
+    }
     bundle.projects = projects;
     pushScenarioAudit(bundle, {
       author: resolveScenarioActor(req),
       note_type: 'auto',
-      note: `Zmiana statusu projektu #${projectId}: „${prev}” → „${status}”.`,
+      note: `Zmiana projektu #${projectId}: ${changes.join('; ')}.`,
       project_id: projectId,
     });
     try {
@@ -169,9 +202,9 @@ scenariosRouter.patch('/:id/projects/:projectId', (req, res) => {
       db.prepare('UPDATE scenarios SET snapshot = ? WHERE id = ?').run(JSON.stringify(bundle), id);
     }
     saveDb();
-    res.json({ id: projectId, status });
+    res.json({ id: projectId, status: proj.status ?? 'active', sop: proj.sop ?? null, eop: proj.eop ?? null });
   } catch (e: any) {
-    res.status(500).json({ error: e?.message || 'Błąd zapisu statusu w scenariuszu' });
+    res.status(500).json({ error: e?.message || 'Błąd zapisu zmian projektu w scenariuszu' });
   }
 });
 
@@ -236,6 +269,107 @@ scenariosRouter.patch('/:id/parts/:partId', (req, res) => {
     res.json({ id: partId, status: (parts[idx] as any).status ?? null });
   } catch (e: any) {
     res.status(500).json({ error: e?.message || 'Błąd zapisu statusu detalu w scenariuszu' });
+  }
+});
+
+const SCENARIO_VOLUME_UNITS = ['annual', 'monthly', 'weekly'] as const;
+
+/**
+ * Wolumen detalu (roczne wartości) w snapshotcie scenariusza — tylko ten scenariusz, bez wpływu na produkcję.
+ * `{ mode: 'override', volumes: [...] }` zapisuje nadpisanie na wskazane lata.
+ * `{ mode: 'project' }` usuwa nadpisanie (detal wraca do dziedziczenia wolumenu z projektu).
+ */
+scenariosRouter.put('/:id/parts/:partId/volumes', (req, res) => {
+  const id = Number(req.params.id);
+  const partId = Number(req.params.partId);
+  if (!Number.isFinite(partId) || partId <= 0) return res.status(400).json({ error: 'Nieprawidłowy identyfikator detalu.' });
+  const row = db.prepare('SELECT snapshot, archived_at FROM scenarios WHERE id = ?').get(id) as
+    | { snapshot: string; archived_at: string | null }
+    | undefined;
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  if (row.archived_at != null && String(row.archived_at).trim() !== '') {
+    return res.status(400).json({ error: 'Scenariusz zarchiwizowany — edycja jest wyłączona.' });
+  }
+  const body = (req.body ?? {}) as {
+    mode?: unknown;
+    volumes?: { year?: unknown; volume_value?: unknown; volume_unit?: unknown }[];
+  };
+  const mode = String(body.mode ?? 'override').trim();
+  if (mode !== 'override' && mode !== 'project') {
+    return res.status(400).json({ error: 'Podaj mode: override lub project.' });
+  }
+  try {
+    const bundle = parseScenarioSnapshotJson(row.snapshot);
+    const parts = bundle.parts || [];
+    const idx = parts.findIndex((pt: any) => Number(pt.id) === partId);
+    if (idx < 0) return res.status(404).json({ error: 'Detal nie występuje w tym scenariuszu.' });
+    const part = parts[idx] as any;
+    const projectId = Number(part.project_id) || null;
+    const before = bundle.part_volume_by_year || [];
+    const others = before.filter((r: any) => Number(r.part_id) !== partId);
+
+    if (mode === 'project') {
+      const hadOverride = String(part.volume_mode ?? 'project') === 'override';
+      if (!hadOverride && others.length === before.length) {
+        return res.json({ id: partId, volume_mode: 'project', volumes: [], unchanged: true });
+      }
+      part.volume_mode = 'project';
+      bundle.part_volume_by_year = others;
+      pushScenarioAudit(bundle, {
+        author: resolveScenarioActor(req),
+        note_type: 'auto',
+        note: `Wolumen detalu #${partId}: usunięto nadpisanie (dziedziczy z projektu).`,
+        project_id: projectId,
+        part_id: partId,
+      });
+    } else {
+      const entries = (Array.isArray(body.volumes) ? body.volumes : [])
+        .map((v) => ({
+          year: Math.trunc(Number(v?.year)),
+          volume_value: Number(v?.volume_value),
+          volume_unit: SCENARIO_VOLUME_UNITS.includes(v?.volume_unit as any) ? (v!.volume_unit as string) : 'annual',
+        }))
+        .filter(
+          (v) => Number.isFinite(v.year) && v.year >= 1900 && v.year <= 2200 && Number.isFinite(v.volume_value) && v.volume_value >= 0
+        );
+      if (entries.length === 0) {
+        return res.status(400).json({ error: 'Podaj przynajmniej jeden rok z wolumenem (≥ 0).' });
+      }
+      part.volume_mode = 'override';
+      bundle.part_volume_by_year = [
+        ...others,
+        ...entries.map((e) => ({
+          part_id: partId,
+          year: e.year,
+          volume_value: e.volume_value,
+          volume_unit: e.volume_unit,
+          volume_origin: 'manual_year',
+        })),
+      ];
+      pushScenarioAudit(bundle, {
+        author: resolveScenarioActor(req),
+        note_type: 'auto',
+        note: `Wolumen detalu #${partId}: nadpisanie (tylko scenariusz) dla lat ${entries.map((e) => e.year).join(', ')}.`,
+        project_id: projectId,
+        part_id: partId,
+      });
+    }
+    bundle.parts = parts;
+    try {
+      db.prepare(`UPDATE scenarios SET snapshot = ?, updated_at = datetime('now') WHERE id = ?`).run(JSON.stringify(bundle), id);
+    } catch {
+      db.prepare('UPDATE scenarios SET snapshot = ? WHERE id = ?').run(JSON.stringify(bundle), id);
+    }
+    saveDb();
+    res.json({
+      id: partId,
+      volume_mode: part.volume_mode ?? 'project',
+      volumes: (bundle.part_volume_by_year || [])
+        .filter((r: any) => Number(r.part_id) === partId)
+        .sort((a: any, b: any) => Number(a.year) - Number(b.year)),
+    });
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || 'Błąd zapisu wolumenu detalu w scenariuszu' });
   }
 });
 

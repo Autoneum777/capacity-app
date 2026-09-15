@@ -26,6 +26,7 @@ type MachineFormState = {
   location: string;
   machine_usage: string;
   oee_override: string;
+  is_baseline: boolean;
 };
 
 const EMPTY_MACHINE: MachineFormState = {
@@ -36,6 +37,7 @@ const EMPTY_MACHINE: MachineFormState = {
   location: '',
   machine_usage: '1',
   oee_override: '',
+  is_baseline: false,
 };
 
 function parseStatusFromImportCell(raw: unknown): MachineFormStatus {
@@ -239,6 +241,7 @@ export default function Machines() {
       location: lineStored,
       machine_usage: machineUsage,
       oee_override: form.oee_override !== '' ? Number(form.oee_override) : null,
+      is_baseline: form.is_baseline ? 1 : 0,
     }).then(() => {
       setAddModal(false);
       load();
@@ -503,6 +506,14 @@ export default function Machines() {
                   placeholder={t('machines.internalPlaceholder')}
                   style={{ width: '100%', padding: 6 }}
                 />
+              </label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={form.is_baseline}
+                  onChange={(e) => setForm((f) => ({ ...f, is_baseline: e.target.checked }))}
+                />
+                <span>{t('machines.baselineMachine')}</span>
               </label>
               <label style={{ display: 'block' }}>
                 {t('machines.typeRequired')}{' '}

@@ -8,6 +8,10 @@ import StatusMultiFilter, { type ProjectStatusFilterValue } from '../components/
 import SortableTh from '../components/SortableTh';
 import { useTableSort, sortRows } from '../utils/tableSort';
 import { useI18n } from '../context/I18nContext';
+import { formatSopEop, sopEopYearsRange } from '../utils/sopEopFormat';
+
+type VolumeUnit = 'annual' | 'monthly' | 'weekly';
+type VolumeDraftRow = { year: number; volume_value: string; volume_unit: VolumeUnit };
 
 const INHERIT = '__inherit__';
 type LineStatus = 'active' | 'inactive' | 'RFQ';
@@ -58,6 +62,40 @@ function statusControlColors(st: string): { background: string; color: string } 
   return { background: '#9e9e9e', color: 'white' };
 }
 
+/** Edytowalna komórka SOP/EOP w tabeli — zapis dopiero na blur (nie na każdy znak), tylko w scenariuszu. */
+function SopEopInput({
+  value,
+  disabled,
+  onSave,
+}: {
+  value: string | null | undefined;
+  disabled: boolean;
+  onSave: (next: string) => void;
+}) {
+  const [draft, setDraft] = useState(formatSopEop(value ?? ''));
+  useEffect(() => {
+    setDraft(formatSopEop(value ?? ''));
+  }, [value]);
+  return (
+    <input
+      type="text"
+      value={draft}
+      disabled={disabled}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={() => {
+        const next = draft.trim();
+        if (next !== formatSopEop(value ?? '')) onSave(next);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+      }}
+      placeholder="MM.RRRR"
+      title="MM.RRRR (np. 6.2026)"
+      style={{ width: 84, padding: '0.3rem', border: '1px solid #ccc', borderRadius: 4, fontSize: 13 }}
+    />
+  );
+}
+
 /** Wcięcia poziomów drzewka (px od lewej krawędzi komórki z treścią). */
 const TREE_INDENT_EXPAND_PART = 22;
 const TREE_INDENT_LABEL_PART = 30;
@@ -101,6 +139,10 @@ export default function ScenarioView() {
   const [addProjectsBusy, setAddProjectsBusy] = useState(false);
   const [addProjectsError, setAddProjectsError] = useState<string | null>(null);
   const [scenarioActionInfo, setScenarioActionInfo] = useState<string | null>(null);
+  const [volumeModalPart, setVolumeModalPart] = useState<{ part: any; project: any } | null>(null);
+  const [volumeDraft, setVolumeDraft] = useState<VolumeDraftRow[]>([]);
+  const [volumeSaving, setVolumeSaving] = useState(false);
+  const [volumeError, setVolumeError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!id) return;
@@ -220,6 +262,39 @@ export default function ScenarioView() {
     }
   };
 
+  /** SOP/EOP projektu — tylko w tym scenariuszu (snapshot), nie zmienia produkcji. */
+  const handleScenarioProjectDate = async (p: any, field: 'sop' | 'eop', nextValue: string) => {
+    const sid = scenario?.id;
+    if (!sid || scenario?.archived_at) return;
+    const pid = Number(p.id);
+    if (!Number.isFinite(pid)) return;
+    const prev = String(p[field] ?? '');
+    if (prev === nextValue) return;
+    setProjectStatusError(null);
+    setStatusSavingKey(`${field}:${pid}`);
+    setScenario((s) => {
+      if (!s?.snapshot?.projects) return s;
+      const nextProjects = (s.snapshot.projects as any[]).map((pr: any) =>
+        Number(pr.id) === pid ? { ...pr, [field]: nextValue } : pr
+      );
+      return { ...s, snapshot: { ...s.snapshot, projects: nextProjects } };
+    });
+    try {
+      await api.scenarios.patchProjectSopEop(sid, pid, { [field]: nextValue });
+    } catch (e: any) {
+      setScenario((s) => {
+        if (!s?.snapshot?.projects) return s;
+        const nextProjects = (s.snapshot.projects as any[]).map((pr: any) =>
+          Number(pr.id) === pid ? { ...pr, [field]: prev } : pr
+        );
+        return { ...s, snapshot: { ...s.snapshot, projects: nextProjects } };
+      });
+      setProjectStatusError(te(e?.message) || t('scenarioViewExtra.statusSaveFailed'));
+    } finally {
+      setStatusSavingKey(null);
+    }
+  };
+
   const handlePartStatus = async (_p: any, pt: any, next: LineStatus | null) => {
     const sid = scenario?.id;
     if (!sid || scenario?.archived_at) return;
@@ -303,6 +378,94 @@ export default function ScenarioView() {
       setProjectStatusError(te(e?.message) || t('scenarioViewExtra.statusSaveFailed'));
     } finally {
       setStatusSavingKey(null);
+    }
+  };
+
+  /** Otwiera modal wolumenu detalu — wypełniony istniejącym nadpisaniem (jeśli jest) albo zerami dla lat SOP–EOP projektu. */
+  const openVolumeModal = (p: any, pt: any) => {
+    setVolumeError(null);
+    const range = sopEopYearsRange(p?.sop, p?.eop).years;
+    const existing = ((scenario?.snapshot?.part_volume_by_year as any[]) ?? []).filter(
+      (r: any) => Number(r.part_id) === Number(pt.id)
+    );
+    const existingByYear = new Map(existing.map((r: any) => [Number(r.year), r]));
+    const years = [...new Set<number>([...range, ...existing.map((r: any) => Number(r.year))])].sort((a, b) => a - b);
+    const draft: VolumeDraftRow[] = (years.length > 0 ? years : [new Date().getFullYear()]).map((year) => {
+      const row = existingByYear.get(year);
+      return {
+        year,
+        volume_value: row ? String(row.volume_value) : '0',
+        volume_unit: (row?.volume_unit as VolumeUnit) ?? 'annual',
+      };
+    });
+    setVolumeDraft(draft);
+    setVolumeModalPart({ part: pt, project: p });
+  };
+
+  const closeVolumeModal = () => {
+    if (volumeSaving) return;
+    setVolumeModalPart(null);
+    setVolumeError(null);
+  };
+
+  const updateVolumeDraftRow = (year: number, field: 'volume_value' | 'volume_unit', value: string) => {
+    setVolumeDraft((prev) => prev.map((r) => (r.year === year ? { ...r, [field]: value } : r)));
+  };
+
+  /** Zapisuje w snapshotcie lokalnie (bez ponownego GET) — odpowiedź serwera ma znormalizowane wiersze. */
+  const applyPartVolumeResult = (
+    partId: number,
+    res: { volume_mode: string; volumes: { part_id: number; year: number; volume_value: number; volume_unit: string }[] }
+  ) => {
+    setScenario((s) => {
+      if (!s?.snapshot) return s;
+      const nextParts = ((s.snapshot.parts as any[]) ?? []).map((pt: any) =>
+        Number(pt.id) === partId ? { ...pt, volume_mode: res.volume_mode } : pt
+      );
+      const others = ((s.snapshot.part_volume_by_year as any[]) ?? []).filter((r: any) => Number(r.part_id) !== partId);
+      return {
+        ...s,
+        snapshot: { ...s.snapshot, parts: nextParts, part_volume_by_year: [...others, ...res.volumes] },
+      };
+    });
+  };
+
+  const saveVolumeOverride = async () => {
+    const sid = scenario?.id;
+    if (!sid || !volumeModalPart) return;
+    const entries = volumeDraft
+      .map((d) => ({ year: Number(d.year), volume_value: Number(d.volume_value), volume_unit: d.volume_unit }))
+      .filter((d) => Number.isFinite(d.year) && Number.isFinite(d.volume_value) && d.volume_value >= 0);
+    if (entries.length === 0) {
+      setVolumeError('Podaj przynajmniej jeden rok z wolumenem (≥ 0).');
+      return;
+    }
+    setVolumeSaving(true);
+    setVolumeError(null);
+    try {
+      const res = await api.scenarios.putPartVolumes(sid, Number(volumeModalPart.part.id), { mode: 'override', volumes: entries });
+      applyPartVolumeResult(Number(volumeModalPart.part.id), res);
+      setVolumeModalPart(null);
+    } catch (e: any) {
+      setVolumeError(te(e?.message) || 'Błąd zapisu wolumenu detalu.');
+    } finally {
+      setVolumeSaving(false);
+    }
+  };
+
+  const resetVolumeOverride = async () => {
+    const sid = scenario?.id;
+    if (!sid || !volumeModalPart) return;
+    setVolumeSaving(true);
+    setVolumeError(null);
+    try {
+      const res = await api.scenarios.putPartVolumes(sid, Number(volumeModalPart.part.id), { mode: 'project' });
+      applyPartVolumeResult(Number(volumeModalPart.part.id), res);
+      setVolumeModalPart(null);
+    } catch (e: any) {
+      setVolumeError(te(e?.message) || 'Błąd zapisu wolumenu detalu.');
+    } finally {
+      setVolumeSaving(false);
     }
   };
 
@@ -579,6 +742,136 @@ export default function ScenarioView() {
           </div>
         </div>
       )}
+      {volumeModalPart && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="volume-modal-title"
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0,0,0,0.45)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1100,
+            padding: 16,
+          }}
+          onClick={closeVolumeModal}
+        >
+          <div
+            style={{
+              background: 'white',
+              maxWidth: 560,
+              width: '100%',
+              maxHeight: '90vh',
+              overflow: 'auto',
+              display: 'flex',
+              flexDirection: 'column',
+              padding: '1.25rem',
+              borderRadius: 8,
+              boxShadow: '0 4px 20px rgba(0,0,0,0.2)',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 id="volume-modal-title" style={{ marginTop: 0, fontSize: '1.1rem' }}>
+              Wolumen detalu: {partLabel(volumeModalPart.part)}
+            </h2>
+            <p style={{ color: '#555', fontSize: 13, lineHeight: 1.45, marginBottom: 12 }}>
+              Zmiana obowiązuje tylko w tym scenariuszu — nie wpływa na kalkulator produkcyjny. Bieżący tryb:{' '}
+              <strong>
+                {String(volumeModalPart.part.volume_mode ?? 'project') === 'override'
+                  ? 'nadpisanie (scenariusz)'
+                  : 'dziedziczy z projektu'}
+              </strong>
+              .
+            </p>
+            {volumeError ? <p style={{ color: 'var(--cap-red)', marginBottom: 8, fontSize: 13 }}>{volumeError}</p> : null}
+            <div style={{ overflow: 'auto', maxHeight: 'min(48vh, 380px)', border: '1px solid #e0e0e0', borderRadius: 6, marginBottom: 12 }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                <thead>
+                  <tr style={{ background: '#f5f5f5', position: 'sticky', top: 0 }}>
+                    <th style={{ padding: '0.4rem', textAlign: 'left' }}>Rok</th>
+                    <th style={{ padding: '0.4rem', textAlign: 'left' }}>Wolumen</th>
+                    <th style={{ padding: '0.4rem', textAlign: 'left' }}>Jednostka</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {volumeDraft.map((row) => (
+                    <tr key={row.year} style={{ borderTop: '1px solid #eee' }}>
+                      <td style={{ padding: '0.35rem 0.4rem', fontWeight: 600 }}>{row.year}</td>
+                      <td style={{ padding: '0.35rem 0.4rem' }}>
+                        <input
+                          type="number"
+                          min={0}
+                          value={row.volume_value}
+                          onChange={(e) => updateVolumeDraftRow(row.year, 'volume_value', e.target.value)}
+                          style={{ width: 110, padding: '0.3rem', border: '1px solid #ccc', borderRadius: 4 }}
+                        />
+                      </td>
+                      <td style={{ padding: '0.35rem 0.4rem' }}>
+                        <select
+                          value={row.volume_unit}
+                          onChange={(e) => updateVolumeDraftRow(row.year, 'volume_unit', e.target.value)}
+                          style={{ padding: '0.3rem', border: '1px solid #ccc', borderRadius: 4 }}
+                        >
+                          <option value="annual">rocznie</option>
+                          <option value="monthly">miesięcznie</option>
+                          <option value="weekly">tygodniowo</option>
+                        </select>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                disabled={volumeSaving}
+                onClick={() => void resetVolumeOverride()}
+                title="Usuwa nadpisanie — detal wraca do wolumenu dziedziczonego z projektu"
+                style={{
+                  padding: '0.5rem 1rem',
+                  background: '#fff',
+                  color: '#9e9e9e',
+                  border: '1px solid #ccc',
+                  borderRadius: 4,
+                  cursor: volumeSaving ? 'not-allowed' : 'pointer',
+                }}
+              >
+                Przywróć wolumen z projektu
+              </button>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button
+                  type="button"
+                  disabled={volumeSaving}
+                  onClick={closeVolumeModal}
+                  style={{ padding: '0.5rem 1rem', background: '#9e9e9e', color: 'white', border: 'none', borderRadius: 4, cursor: volumeSaving ? 'not-allowed' : 'pointer' }}
+                >
+                  {t('common.cancel')}
+                </button>
+                <button
+                  type="button"
+                  disabled={volumeSaving}
+                  onClick={() => void saveVolumeOverride()}
+                  style={{
+                    padding: '0.5rem 1rem',
+                    background: 'var(--cap-green)',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: 4,
+                    cursor: volumeSaving ? 'not-allowed' : 'pointer',
+                    fontWeight: 600,
+                  }}
+                >
+                  {volumeSaving ? t('common.saving') : t('common.save')}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
       <h2 style={{ marginTop: '1.5rem' }}>{t('scenarioViewExtra.projectsInScenario')}</h2>
       {projectStatusError ? <p style={{ color: 'var(--cap-red)', marginBottom: 8 }}>{projectStatusError}</p> : null}
       <p style={{ margin: '0 0 0.75rem', fontSize: 14, color: '#555', maxWidth: 920 }}>
@@ -673,8 +966,20 @@ export default function ScenarioView() {
                   </td>
                   <td style={{ padding: '0.75rem' }}>{p.client}</td>
                   <td style={{ padding: '0.75rem' }}>{p.name}</td>
-                  <td style={{ padding: '0.75rem' }}>{p.sop}</td>
-                  <td style={{ padding: '0.75rem' }}>{p.eop}</td>
+                  <td style={{ padding: '0.5rem 0.75rem' }}>
+                    <SopEopInput
+                      value={p.sop}
+                      disabled={!!scenario.archived_at}
+                      onSave={(next) => void handleScenarioProjectDate(p, 'sop', next)}
+                    />
+                  </td>
+                  <td style={{ padding: '0.5rem 0.75rem' }}>
+                    <SopEopInput
+                      value={p.eop}
+                      disabled={!!scenario.archived_at}
+                      onSave={(next) => void handleScenarioProjectDate(p, 'eop', next)}
+                    />
+                  </td>
                   <td style={{ padding: '0.75rem' }}>
                     <select
                       value={p.status ?? 'active'}
@@ -746,6 +1051,24 @@ export default function ScenarioView() {
                             }}
                           >
                             <strong>Detal:</strong> {partLabel(pt)} <span style={{ color: '#888' }}>(#{tid})</span>
+                            <button
+                              type="button"
+                              onClick={() => openVolumeModal(p, pt)}
+                              disabled={!!scenario.archived_at}
+                              title="Zmiana wolumenu — tylko w tym scenariuszu, nie zmienia produkcji"
+                              style={{
+                                marginLeft: 10,
+                                padding: '2px 8px',
+                                fontSize: 12,
+                                border: '1px solid #1565c0',
+                                borderRadius: 4,
+                                background: String(pt.volume_mode ?? 'project') === 'override' ? '#e3f2fd' : '#fff',
+                                color: '#0d47a1',
+                                cursor: scenario.archived_at ? 'not-allowed' : 'pointer',
+                              }}
+                            >
+                              Wolumen{String(pt.volume_mode ?? 'project') === 'override' ? ' (nadpisany)' : ''}
+                            </button>
                           </td>
                           <td style={{ padding: '0.55rem 0.75rem', fontSize: 13, color: '#888' }}>—</td>
                           <td style={{ padding: '0.55rem 0.75rem', fontSize: 13, color: '#888' }}>—</td>

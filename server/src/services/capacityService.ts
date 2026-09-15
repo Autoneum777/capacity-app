@@ -30,6 +30,38 @@ import {
   getSapWeekRangeForMonth,
   averageLoadPercent,
 } from './callOffService.js';
+import {
+  baselineAvailabilitySeconds,
+  baselineRequiredSeconds,
+  baselineRequiredSecondsPerMaterial,
+  baselineMaterialHourlyCapacity,
+  baselineExternalVolumeRequiredSeconds,
+  loadBaselineMaterialIndex,
+  loadBaselineExternalVolumeIndex,
+  loadBaselineExternalMaterialIndex,
+  orientBaselineDimensions,
+  type BaselineMaterialIndex,
+  type BaselineExternalVolumeIndex,
+  type BaselineExternalMaterialIndex,
+} from './baselineCapacityService.js';
+import { resolveBaselineMaterialAlias } from '../utils/baselineMaterialMass.js';
+
+export type MaterialBreakdownDetailItem = {
+  project_label: string;
+  detail_label: string;
+  contribution_percent: number;
+};
+
+/** Rozbicie obciążenia maszyny bazowej na materiały (tooltip kalkulatora) — z wymiarem i gramaturą do etykiety. */
+export type MaterialBreakdownItem = {
+  material_alias: string | null;
+  material_sap: string | null;
+  material_width_mm: number | null;
+  material_length_mm: number | null;
+  material_grammage_kg_m2: number | null;
+  contribution_percent: number;
+  details: MaterialBreakdownDetailItem[];
+};
 
 function indexOperationsByMachine(operations: any[]): Map<number, any[]> {
   const map = new Map<number, any[]>();
@@ -56,6 +88,9 @@ export type OperationYearVolumeRow = {
 export type CapacityComputeShared = {
   operations: any[];
   operationsByMachine: Map<number, any[]>;
+  baselineMaterials: BaselineMaterialIndex;
+  baselineExternalVolumes: BaselineExternalVolumeIndex;
+  baselineExternalMaterials: BaselineExternalMaterialIndex;
   refMode: ReturnType<typeof loadReferenceDisplayMode>;
   volumePrefetchByYear: Map<number, VolumePrefetchMaps>;
   opVolumeMapByYear: Map<number, Map<number, OperationYearVolumeRow>>;
@@ -76,6 +111,7 @@ const CAPACITY_OPS_SELECT = `
            pd.sap_number AS detail_sap_number,
            pd.alias AS detail_alias,
            pd.free_text AS detail_free_text,
+           pd.id AS detail_designation_id,
            pt.designation AS detail_designation
     FROM operations o
     JOIN projects p ON p.id = o.project_id
@@ -108,6 +144,89 @@ function mergeOperationsById(base: any[], extra: any[]): any[] {
     if (Number.isFinite(id)) byId.set(id, o);
   }
   return [...byId.values()];
+}
+
+const BASELINE_INFERRED_OPERATION = 'baseline_material_demand';
+
+function baselineSyntheticOperationId(machineId: number, partId: number): number {
+  return -(machineId * 1_000_000_000 + partId);
+}
+
+/**
+ * Linia bazowa nie wymaga ręcznego dodawania operacji. Jej popyt wynika
+ * automatycznie z: materiał → detal katalogowy → wystąpienia detalu w projektach.
+ */
+function loadBaselineMaterialDemandOperations(
+  scenario: ScenarioBundle | null,
+  allowedProjectIds?: Set<number>
+): any[] {
+  const links = db
+    .prepare(
+      `SELECT DISTINCT bm.machine_id, bmp.designation_id
+       FROM machine_baseline_material_parts bmp
+       JOIN machine_baseline_materials bm ON bm.id = bmp.material_id
+       JOIN machines m ON m.id = bm.machine_id
+       WHERE m.is_baseline = 1
+         AND bm.include_in_capacity = 1`
+    )
+    .all() as { machine_id: number; designation_id: number }[];
+  if (!links.length) return [];
+
+  const machinesByDesignation = new Map<number, number[]>();
+  for (const link of links) {
+    const did = Number(link.designation_id);
+    const list = machinesByDesignation.get(did);
+    if (list) list.push(Number(link.machine_id));
+    else machinesByDesignation.set(did, [Number(link.machine_id)]);
+  }
+
+  const parts = scenario
+    ? scenario.parts ?? []
+    : (db.prepare('SELECT * FROM parts').all() as any[]);
+  const projects = scenario
+    ? scenario.projects ?? []
+    : (db.prepare('SELECT * FROM projects').all() as any[]);
+  const designations = scenario
+    ? scenario.part_designations ?? []
+    : (db.prepare('SELECT * FROM part_designations').all() as any[]);
+  const projectsById = new Map(projects.map((p: any) => [Number(p.id), p]));
+  const designationsById = new Map(designations.map((d: any) => [Number(d.id), d]));
+  const result: any[] = [];
+
+  for (const part of parts) {
+    const partId = Number(part.id);
+    const projectId = Number(part.project_id);
+    const designationId = Number(part.designation_id);
+    if (![partId, projectId, designationId].every(Number.isFinite)) continue;
+    if (allowedProjectIds && !allowedProjectIds.has(projectId)) continue;
+    const project: any = projectsById.get(projectId);
+    if (!project || String(project.status ?? 'active') !== 'active') continue;
+    const designation: any = designationsById.get(designationId);
+    for (const machineId of machinesByDesignation.get(designationId) ?? []) {
+      result.push({
+        operation_id: baselineSyntheticOperationId(machineId, partId),
+        project_id: projectId,
+        part_id: partId,
+        machine_id: machineId,
+        cycle_time_seconds: 0,
+        nests_count: 1,
+        capacity_percent: 100,
+        split_from_operation_id: null,
+        sop: project.sop ?? '',
+        eop: project.eop ?? '',
+        project_status: project.status ?? 'active',
+        project_client: project.client ?? '',
+        project_name: project.name ?? '',
+        detail_sap_number: designation?.sap_number ?? null,
+        detail_alias: designation?.alias ?? null,
+        detail_free_text: designation?.free_text ?? null,
+        detail_designation_id: designationId,
+        detail_designation: part.designation ?? null,
+        baseline_inferred_source: BASELINE_INFERRED_OPERATION,
+      });
+    }
+  }
+  return result;
 }
 
 export function resolveMachineIdsForRfqOperations(operationIds: number[]): number[] {
@@ -198,6 +317,19 @@ function buildCapacityComputeShared(
     }
   }
 
+  const allowedBaselineProjects =
+    operationsOverride != null
+      ? new Set(
+          operationsOverride
+            .map((o: any) => Number(o.project_id))
+            .filter((id: number) => Number.isFinite(id))
+        )
+      : undefined;
+  operations = mergeOperationsById(
+    operations,
+    loadBaselineMaterialDemandOperations(scenario, allowedBaselineProjects)
+  );
+
   const { projectIds, partIds } = collectProjectPartIdsFromOperations(operations);
   const settingsByYear = new Map<number, WorkingDaysRow>();
   for (let y = yearFrom; y <= yearTo; y++) {
@@ -212,6 +344,9 @@ function buildCapacityComputeShared(
   return {
     operations,
     operationsByMachine: indexOperationsByMachine(operations),
+    baselineMaterials: loadBaselineMaterialIndex(),
+    baselineExternalVolumes: loadBaselineExternalVolumeIndex(),
+    baselineExternalMaterials: loadBaselineExternalMaterialIndex(),
     refMode: loadReferenceDisplayMode(),
     volumePrefetchByYear:
       scenario != null ? new Map() : buildVolumePrefetchForYearRange(yearFrom, yearTo, projectIds, partIds),
@@ -308,6 +443,13 @@ function scenarioLinkedRfqProductionMachineIds(snapshot: ScenarioBundle, include
 
 /** Calendar weeks per year (for days-per-week conversion). */
 const CALENDAR_WEEKS_PER_YEAR = 52;
+
+function volumeSettingsForMachine(settings: WorkingDaysRow, machine: any): WorkingDaysRow {
+  if (!Number(machine?.is_baseline)) return settings;
+  const rawWeeks = Number(machine?.baseline_weeks_per_year);
+  const weeks = Number.isFinite(rawWeeks) ? Math.max(1, Math.min(53, rawWeeks)) : 52;
+  return { ...settings, working_weeks_per_year: weeks };
+}
 
 /** Domyślne „Dni robocze” gdy w bazie brak wpisu dla danego roku (szablon z ustawień). */
 export const DEFAULT_WORKING_DAYS_SETTINGS = {
@@ -1416,6 +1558,11 @@ function buildCallOffOperationShares(
   callOffVolumes: CallOffVolumeMaps
 ): Map<number, number> {
   const callOffOpShare = new Map<number, number>();
+  for (const op of allOps) {
+    if (op.baseline_inferred_source !== BASELINE_INFERRED_OPERATION) continue;
+    const opKey = Number(op.operation_id ?? op.id);
+    if (Number.isFinite(opKey)) callOffOpShare.set(opKey, 1);
+  }
 
   // 1) Udziały z nadpisań alokacji — indeks split ze snapshotu/ops + baza produkcyjna.
   //    Samo DB nie widzi alokacji zrobionych tylko w scenariuszu → obie maszyny dostawały 100% SAP.
@@ -1496,6 +1643,7 @@ function buildCallOffOperationShares(
     for (const op of allOps) {
       const opKey = Number(op.operation_id ?? op.id);
       if (!Number.isFinite(opKey)) continue;
+      if (op.baseline_inferred_source === BASELINE_INFERRED_OPERATION) continue;
       if (hasAssignedShare(opKey)) continue;
 
       const weekly = weeklyFromResolved(op, opKey, useContractForShare);
@@ -1525,6 +1673,7 @@ function buildCallOffOperationShares(
   for (const op of allOps) {
     const opKey = Number(op.operation_id ?? op.id);
     if (!Number.isFinite(opKey)) continue;
+    if (op.baseline_inferred_source === BASELINE_INFERRED_OPERATION) continue;
     if (hasAssignedShare(opKey)) continue;
     const partId = op.part_id != null ? Number(op.part_id) : null;
     if (partId == null || !Number.isFinite(partId)) continue;
@@ -1617,8 +1766,6 @@ export function getMachineCapacitiesForYear(
   const volumePeriod: 'annual' | 'monthly' | 'weekly' =
     detailVolumePeriod ??
     (activeWeek != null && activeMonth != null ? 'weekly' : activeMonth != null ? 'monthly' : 'annual');
-  const workWeeksForVolume = Math.max(1, settings.working_weeks_per_year ?? 48);
-
   const scenarioRfqs =
     scenarioSnapshotEff != null && operationsOverride != null
       ? scenarioLinkedRfqProductionMachineIds(scenarioSnapshotEff, scenarioIncludeRfqProjects !== false)
@@ -1638,7 +1785,13 @@ export function getMachineCapacitiesForYear(
 
   let machinesSql = `
     SELECT m.id AS machine_id, m.internal_number, m.type, m.sap_number, m.oee_override, m.status AS machine_status, m.location, COALESCE(m.machine_usage, 1) AS machine_usage,
-           m.width_mm, m.depth_mm, m.height_mm, m.stroke_mm
+           m.width_mm, m.depth_mm, m.height_mm, m.stroke_mm,
+           m.is_baseline, m.baseline_available_hours_per_week, m.baseline_weeks_per_year,
+           m.baseline_max_throughput_kg_h, m.baseline_max_throughput_unit,
+           m.baseline_max_speed_m_min, m.baseline_max_speed_unit,
+           m.baseline_max_blank_width_mm, m.baseline_max_blank_width_unit,
+           m.baseline_min_length_mm,
+           m.baseline_max_blanks_across
     FROM machines m
     WHERE ${machineStatusClause}
   `;
@@ -1693,7 +1846,15 @@ export function getMachineCapacitiesForYear(
   })();
 
   return machines.map((m) => {
-    const machineOps = operationsByMachine.get(m.machine_id) ?? [];
+    const machineVolumeSettings = volumeSettingsForMachine(settings, m);
+    const workWeeksForVolume = Math.max(
+      1,
+      machineVolumeSettings.working_weeks_per_year ?? 48
+    );
+    const allMachineOps = operationsByMachine.get(m.machine_id) ?? [];
+    const machineOps = Number(m.is_baseline)
+      ? allMachineOps.filter((op) => op.baseline_inferred_source === BASELINE_INFERRED_OPERATION)
+      : allMachineOps.filter((op) => op.baseline_inferred_source !== BASELINE_INFERRED_OPERATION);
     let totalRequiredSec = 0;
     let loadRatioSum = 0; // suma (wymagany_czas / dostępność_z_OEE_dla_tej_operacji)
     let altBorderRelevant = 0;
@@ -1702,6 +1863,19 @@ export function getMachineCapacitiesForYear(
     const detailContributionSec = new Map<
       string,
       { project_label: string; detail_label: string; requiredSec: number; volumeQuantity: number; hasRfq: boolean }
+    >();
+    /** Tylko dla maszyn bazowych: rozbicie obciążenia na materiały → detale. */
+    const materialContribSec = new Map<
+      number,
+      {
+        alias: string | null;
+        sap_number: string | null;
+        width_mm: number | null;
+        length_mm: number | null;
+        grammage_kg_m2: number | null;
+        requiredSec: number;
+        details: Map<string, { project_label: string; detail_label: string; requiredSec: number }>;
+      }
     >();
     let hasRfq = false;
 
@@ -1765,7 +1939,7 @@ export function getMachineCapacitiesForYear(
       }
       const volValue = resolved.volume_value;
       const volUnit = resolved.volume_unit;
-      const weeklyResolved = resolveWeeklyVolumeFromResolved(volValue, volUnit, settings, {
+      const weeklyResolved = resolveWeeklyVolumeFromResolved(volValue, volUnit, machineVolumeSettings, {
         sop: op.sop ?? '',
         eop: op.eop ?? '',
         year,
@@ -1777,8 +1951,53 @@ export function getMachineCapacitiesForYear(
       let weeklyVol = weeklyResolved.weekly;
       const fraction = weeklyResolved.fraction;
       const { cycleSeconds, nests, oeeForResolve, usesAlternativeInCalculator } = resolveOperationCycleForCalculator(op);
-      const requiredSecOp = weeklyVol * (cycleSeconds / nests);
+      const requiredSecOp = Number(m.is_baseline)
+        ? baselineRequiredSeconds(
+            m,
+            op.detail_designation_id,
+            weeklyVol,
+            computeShared.baselineMaterials
+          )
+        : weeklyVol * (cycleSeconds / nests);
       totalRequiredSec += requiredSecOp;
+
+      // Material breakdown dla maszyn bazowych
+      if (Number(m.is_baseline) && weeklyVol > 1e-9) {
+        const perMat = baselineRequiredSecondsPerMaterial(
+          m,
+          op.detail_designation_id,
+          weeklyVol,
+          computeShared.baselineMaterials
+        );
+        const detLabelForMat = formatDetailSapAliasLabel(
+          { sap_number: op.detail_sap_number, alias: op.detail_alias, free_text: op.detail_free_text, designation: op.detail_designation, id: op.part_id },
+          refMode
+        );
+        const projLabelForMat = formatProjectLabel(op.project_client, op.project_name);
+        for (const { material_id, alias, sap_number, width_mm, length_mm, grammage_kg_m2, requiredSeconds } of perMat) {
+          if (!materialContribSec.has(material_id)) {
+            materialContribSec.set(material_id, {
+              alias,
+              sap_number,
+              width_mm,
+              length_mm,
+              grammage_kg_m2,
+              requiredSec: 0,
+              details: new Map(),
+            });
+          }
+          const matEntry = materialContribSec.get(material_id)!;
+          matEntry.requiredSec += requiredSeconds;
+          const dKey = `${Number(op.project_id)}|${detLabelForMat}`;
+          const existing = matEntry.details.get(dKey);
+          if (existing) {
+            existing.requiredSec += requiredSeconds;
+          } else {
+            matEntry.details.set(dKey, { project_label: projLabelForMat, detail_label: detLabelForMat, requiredSec: requiredSeconds });
+          }
+        }
+      }
+
       if (String(op.project_status ?? '').toUpperCase() === 'RFQ' && weeklyVol > 1e-9) {
         hasRfq = true;
       }
@@ -1833,16 +2052,69 @@ export function getMachineCapacitiesForYear(
         }
       }
       const oeeOp = resolveOee(settings, m.oee_override, oeeForResolve);
-      const availabilitySecOp = availabilitySecondsPerWeek(settings, oeeOp);
+      const availabilitySecOp = Number(m.is_baseline)
+        ? baselineAvailabilitySeconds(m, resolveOee(settings, m.oee_override, null))
+        : availabilitySecondsPerWeek(settings, oeeOp);
       if (availabilitySecOp > 0) {
         loadRatioSum += requiredSecOp / availabilitySecOp;
+      }
+    }
+
+    // Materiały z wolumenem zewnętrznym (linia bazowa) — ich czas doliczamy do totalRequiredSec
+    if (Number(m.is_baseline)) {
+      const extMaterials = computeShared.baselineExternalMaterials.get(Number(m.machine_id)) ?? [];
+      for (const mat of extMaterials) {
+        const mid = Number(mat.material_id);
+        const yearVolumes = computeShared.baselineExternalVolumes.get(mid);
+        if (!yearVolumes) continue;
+        const weeklyVol = yearVolumes.get(year) ?? 0;
+        if (weeklyVol <= 0) continue;
+        const hc = baselineMaterialHourlyCapacity(m, mat);
+        if (hc == null) continue;
+        const shareRaw = Number(mat.production_share_percent);
+        const share = Number.isFinite(shareRaw) ? Math.min(100, Math.max(0, shareRaw)) / 100 : 1;
+        const extSec = (weeklyVol * share / hc.actualCapacityPerHour) * 3600;
+        totalRequiredSec += extSec;
+        const oeeExt = resolveOee(settings, m.oee_override, null);
+        const availExt = baselineAvailabilitySeconds(m, oeeExt);
+        if (availExt > 0) loadRatioSum += extSec / availExt;
+
+        // Dodaj do material breakdown
+        const extAlias = resolveBaselineMaterialAlias(mat.alias, mat.description);
+        const extSap = mat.sap_number ?? null;
+        const extDimA = Number(mat.width_mm);
+        const extDimB = Number(mat.length_mm);
+        const extOriented =
+          Number.isFinite(extDimA) && extDimA > 0 && Number.isFinite(extDimB) && extDimB > 0
+            ? orientBaselineDimensions(m, extDimA, extDimB)
+            : null;
+        if (!materialContribSec.has(mid)) {
+          materialContribSec.set(mid, {
+            alias: extAlias,
+            sap_number: extSap,
+            width_mm: extOriented?.widthMm ?? mat.width_mm ?? null,
+            length_mm: extOriented?.lengthMm ?? mat.length_mm ?? null,
+            grammage_kg_m2: mat.grammage_kg_m2 ?? null,
+            requiredSec: 0,
+            details: new Map(),
+          });
+        }
+        const matEntry = materialContribSec.get(mid)!;
+        matEntry.requiredSec += extSec;
+        if (!matEntry.details.has('__external__')) {
+          matEntry.details.set('__external__', { project_label: '', detail_label: 'Wolumen zewnętrzny', requiredSec: extSec });
+        } else {
+          matEntry.details.get('__external__')!.requiredSec += extSec;
+        }
       }
     }
 
     // Machine usage 0..1: np. 0.5 = podwaja effective capacity (obciążenie maleje dwukrotnie).
     const usage = Math.max(0.1, Math.min(1, m.machine_usage ?? 1));
     const oeeMachine = resolveOee(settings, m.oee_override, null);
-    const availabilitySecBase = availabilitySecondsPerWeek(settings, oeeMachine);
+    const availabilitySecBase = Number(m.is_baseline)
+      ? baselineAvailabilitySeconds(m, oeeMachine)
+      : availabilitySecondsPerWeek(settings, oeeMachine);
     const availabilitySec = availabilitySecBase * (1 / usage);
     const loadPercent =
       availabilitySec > 0
@@ -1868,6 +2140,27 @@ export function getMachineCapacitiesForYear(
       })
       .sort((a, b) => b.contribution_percent - a.contribution_percent);
 
+    const material_breakdown: MaterialBreakdownItem[] | undefined = Number(m.is_baseline)
+      ? Array.from(materialContribSec.entries()).map(([, mat]) => ({
+          material_alias: mat.alias,
+          material_sap: mat.sap_number,
+          material_width_mm: mat.width_mm,
+          material_length_mm: mat.length_mm,
+          material_grammage_kg_m2: mat.grammage_kg_m2,
+          contribution_percent:
+            availabilitySec > 0 ? Math.round((mat.requiredSec / availabilitySec) * 10000) / 100 : 0,
+          details: Array.from(mat.details.values())
+            .map((d) => ({
+              project_label: d.project_label,
+              detail_label: d.detail_label,
+              contribution_percent:
+                availabilitySec > 0 ? Math.round((d.requiredSec / availabilitySec) * 10000) / 100 : 0,
+            }))
+            .sort((a, b) => b.contribution_percent - a.contribution_percent),
+        }))
+        .sort((a, b) => b.contribution_percent - a.contribution_percent)
+      : undefined;
+
     return {
       machine_id: m.machine_id,
       internal_number: m.internal_number,
@@ -1881,6 +2174,7 @@ export function getMachineCapacitiesForYear(
       height_mm: m.height_mm != null && Number.isFinite(Number(m.height_mm)) ? Number(m.height_mm) : null,
       stroke_mm: m.stroke_mm != null && Number.isFinite(Number(m.stroke_mm)) ? Number(m.stroke_mm) : null,
       year,
+      is_baseline: Boolean(m.is_baseline),
       availability_sec_per_week: availabilitySec,
       required_sec_per_week: Math.round(totalRequiredSec),
       capacity_pcs_per_week: capacityPcsWeek,
@@ -1888,6 +2182,7 @@ export function getMachineCapacitiesForYear(
       utilization_percent: loadPercent,
       alternative_border,
       detail_breakdown,
+      material_breakdown,
       has_rfq: hasRfq,
     };
   });
@@ -1930,7 +2225,13 @@ export function getMachineLoadComputationDetails(
 
   const mCandidate = db
     .prepare(`
-    SELECT m.id AS machine_id, m.internal_number, m.type, m.oee_override, m.status, COALESCE(m.machine_usage, 1) AS machine_usage
+    SELECT m.id AS machine_id, m.internal_number, m.type, m.oee_override, m.status, COALESCE(m.machine_usage, 1) AS machine_usage,
+           m.is_baseline, m.baseline_available_hours_per_week, m.baseline_weeks_per_year,
+           m.baseline_max_throughput_kg_h, m.baseline_max_throughput_unit,
+           m.baseline_max_speed_m_min, m.baseline_max_speed_unit,
+           m.baseline_max_blank_width_mm, m.baseline_max_blank_width_unit,
+           m.baseline_min_length_mm,
+           m.baseline_max_blanks_across
     FROM machines m
     WHERE m.id = ?
   `)
@@ -1944,19 +2245,33 @@ export function getMachineLoadComputationDetails(
     if (!allow.includes(machineId)) return null;
   }
   const m = mCandidate;
+  const machineVolumeSettings = volumeSettingsForMachine(settings, m);
 
-  const operations =
+  const baseOperations =
     operationsOverride ??
     (scenarioSnapshot != null
       ? scenarioHydratedOperationsForActiveProjects(scenarioSnapshot, { includeRfq: scenarioIncludeRfq })
       : (db.prepare(`
     SELECT o.id AS operation_id, o.project_id, o.part_id, o.machine_id, o.cycle_time_seconds, o.volume_value, o.volume_unit, o.nests_count, o.oee_override, o.capacity_percent,
            o.alt_cycle_time_seconds, o.alt_nests_count, o.alt_oee_override, o.use_alternative_in_calculator, o.split_from_operation_id,
-           p.sop, p.eop
+           p.sop, p.eop, pt.designation_id AS detail_designation_id
     FROM operations o
     JOIN projects p ON p.id = o.project_id
+    JOIN parts pt ON pt.id = o.part_id
     WHERE p.status = 'active'
   `).all() as any[]));
+  const allowedBaselineProjects =
+    operationsOverride != null
+      ? new Set(
+          operationsOverride
+            .map((o: any) => Number(o.project_id))
+            .filter((id: number) => Number.isFinite(id))
+        )
+      : undefined;
+  const operations = mergeOperationsById(
+    baseOperations,
+    loadBaselineMaterialDemandOperations(scenarioSnapshot ?? null, allowedBaselineProjects)
+  );
 
   const volumeMap = (() => {
     if (scenarioSnapshot != null) {
@@ -2005,7 +2320,16 @@ export function getMachineLoadComputationDetails(
     }
   })();
 
-  const machineOps = operations.filter((o: any) => o.machine_id === m.machine_id);
+  const machineOps = operations.filter(
+    (o: any) =>
+      o.machine_id === m.machine_id &&
+      (Number(m.is_baseline)
+        ? o.baseline_inferred_source === BASELINE_INFERRED_OPERATION
+        : o.baseline_inferred_source !== BASELINE_INFERRED_OPERATION)
+  );
+  const baselineMaterials = loadBaselineMaterialIndex();
+  const baselineExtVolumes = loadBaselineExternalVolumeIndex();
+  const baselineExtMaterials = loadBaselineExternalMaterialIndex();
   let totalRequiredSec = 0;
   let loadRatioSum = 0;
   const opById: Record<
@@ -2055,7 +2379,7 @@ export function getMachineLoadComputationDetails(
     }
     const volValue = resolved.volume_value;
     const volUnit = resolved.volume_unit;
-    const weeklyResolved = resolveWeeklyVolumeFromResolved(volValue, volUnit, settings, {
+    const weeklyResolved = resolveWeeklyVolumeFromResolved(volValue, volUnit, machineVolumeSettings, {
       sop: op.sop ?? '',
       eop: op.eop ?? '',
       year,
@@ -2066,10 +2390,14 @@ export function getMachineLoadComputationDetails(
     const weeklyVol = weeklyResolved.weekly;
     const fraction = weeklyResolved.fraction;
     const { cycleSeconds, nests, oeeForResolve } = resolveOperationCycleForCalculator(op);
-    const requiredSecOp = weeklyVol * (cycleSeconds / nests);
+    const requiredSecOp = Number(m.is_baseline)
+      ? baselineRequiredSeconds(m, op.detail_designation_id, weeklyVol, baselineMaterials)
+      : weeklyVol * (cycleSeconds / nests);
     totalRequiredSec += requiredSecOp;
     const oeeOp = resolveOee(settings, m.oee_override, oeeForResolve);
-    const availabilitySecOp = availabilitySecondsPerWeek(settings, oeeOp);
+    const availabilitySecOp = Number(m.is_baseline)
+      ? baselineAvailabilitySeconds(m, resolveOee(settings, m.oee_override, null))
+      : availabilitySecondsPerWeek(settings, oeeOp);
     const ratioContrib = availabilitySecOp > 0 ? requiredSecOp / availabilitySecOp : 0;
     loadRatioSum += ratioContrib;
     opById[opKey] = {
@@ -2081,9 +2409,20 @@ export function getMachineLoadComputationDetails(
     };
   }
 
+  // Materiały z wolumenem zewnętrznym (linia bazowa)
+  if (Number(m.is_baseline)) {
+    const extSec = baselineExternalVolumeRequiredSeconds(m, year, baselineExtVolumes, baselineExtMaterials);
+    totalRequiredSec += extSec;
+    const oeeExt = resolveOee(settings, m.oee_override, null);
+    const availExt = baselineAvailabilitySeconds(m, oeeExt);
+    if (availExt > 0) loadRatioSum += extSec / availExt;
+  }
+
   const usage = Math.max(0.1, Math.min(1, m.machine_usage ?? 1));
   const oeeMachine = resolveOee(settings, m.oee_override, null);
-  const availabilitySecBase = availabilitySecondsPerWeek(settings, oeeMachine);
+  const availabilitySecBase = Number(m.is_baseline)
+    ? baselineAvailabilitySeconds(m, oeeMachine)
+    : availabilitySecondsPerWeek(settings, oeeMachine);
   const availabilitySec = availabilitySecBase * (1 / usage);
   const loadPercent =
     availabilitySec > 0
@@ -2098,7 +2437,10 @@ export function getMachineLoadComputationDetails(
     load_percent: loadPercent,
     availability_sec_per_week: availabilitySec,
     required_sec_per_week: Math.round(totalRequiredSec),
-    working_weeks_per_year: Math.max(1, settings.working_weeks_per_year ?? 48),
+    working_weeks_per_year: Math.max(
+      1,
+      machineVolumeSettings.working_weeks_per_year ?? 48
+    ),
     op_by_id: opById,
   };
 }
@@ -2122,6 +2464,7 @@ export function getMachineCapacityByYears(
   internal_number: string | number;
   sap_number: string | null;
   type: string;
+  is_baseline: boolean;
   machine_status: string | null;
   location: string | null;
   width_mm: number | null;
@@ -2144,6 +2487,7 @@ export function getMachineCapacityByYears(
         volume_quantity: number;
         has_rfq: boolean;
       }[];
+      material_breakdown?: MaterialBreakdownItem[];
       has_rfq?: boolean;
     }
   >;
@@ -2154,6 +2498,7 @@ export function getMachineCapacityByYears(
       internal_number: string | number;
       sap_number: string | null;
       type: string;
+      is_baseline: boolean;
       machine_status: string | null;
       location: string | null;
       width_mm: number | null;
@@ -2222,6 +2567,7 @@ export function getMachineCapacityByYears(
           internal_number: r.internal_number,
           sap_number: r.sap_number ?? null,
           type: r.type,
+          is_baseline: Boolean((r as any).is_baseline),
           machine_status: r.machine_status != null ? String(r.machine_status) : null,
           location: r.location != null ? String(r.location).trim() || null : null,
           width_mm: r.width_mm != null && Number.isFinite(Number(r.width_mm)) ? Number(r.width_mm) : null,
@@ -2247,6 +2593,7 @@ export function getMachineCapacityByYears(
         availability_sec_per_week: r.availability_sec_per_week,
         alternative_border: r.alternative_border,
         detail_breakdown: r.detail_breakdown ?? [],
+        material_breakdown: (r as any).material_breakdown ?? undefined,
         has_rfq: Boolean(r.has_rfq),
       };
     }
@@ -2257,6 +2604,7 @@ export function getMachineCapacityByYears(
     internal_number: v.internal_number,
     sap_number: v.sap_number,
     type: v.type,
+    is_baseline: (v as any).is_baseline ?? false,
     machine_status: v.machine_status,
     location: v.location,
     width_mm: v.width_mm,
@@ -2281,6 +2629,7 @@ export type MachinePeriodMonthBreakdown = {
         volume_quantity: number;
         has_rfq: boolean;
       }[];
+      material_breakdown?: MaterialBreakdownItem[];
     }
   >;
   has_sop: boolean;
@@ -2293,6 +2642,7 @@ export type MachinePeriodMonthBreakdown = {
     volume_quantity: number;
     has_rfq: boolean;
   }[];
+  material_breakdown?: MaterialBreakdownItem[];
 };
 
 export type MachinePeriodBreakdownRow = {
@@ -2427,16 +2777,20 @@ type MonthPeakDetail = {
 }[];
 
 /**
- * Rozkład detali do tooltipa przy średniej obciążenia:
+ * Rozkład detali i materiałów (linie bazowe) do tooltipa przy średniej obciążenia:
  * wybierz okres najbliższy targetLoad, ale preferuj okresy z niepustym breakdown
  * (inaczej „najbliższy” często jest 0% bez detali przy średniej np. 25–60%).
+ * Używane wszędzie, gdzie miesiąc/rok = średnia tygodni/miesięcy
+ * (getMachinePeriodBreakdown, getMachineMonthlyLoadsByMonth/AverageLoads).
  */
-function pickDetailBreakdownClosestToLoad(
-  candidates: { load_percent: number; detail_breakdown: MonthPeakDetail }[],
+function pickBreakdownsClosestToLoad(
+  candidates: { load_percent: number; detail_breakdown: MonthPeakDetail; material_breakdown: MaterialBreakdownItem[] }[],
   targetLoad: number
-): MonthPeakDetail {
-  if (candidates.length === 0) return [];
-  const withDetails = candidates.filter((c) => (c.detail_breakdown?.length ?? 0) > 0);
+): { detail_breakdown: MonthPeakDetail; material_breakdown: MaterialBreakdownItem[] } {
+  if (candidates.length === 0) return { detail_breakdown: [], material_breakdown: [] };
+  const withDetails = candidates.filter(
+    (c) => (c.detail_breakdown?.length ?? 0) > 0 || (c.material_breakdown?.length ?? 0) > 0
+  );
   const pool = withDetails.length > 0 ? withDetails : candidates;
   let best = pool[0]!;
   let bestDist = Math.abs(Number(best.load_percent) - targetLoad);
@@ -2448,7 +2802,7 @@ function pickDetailBreakdownClosestToLoad(
       best = c;
     }
   }
-  return best.detail_breakdown ?? [];
+  return { detail_breakdown: best.detail_breakdown ?? [], material_breakdown: best.material_breakdown ?? [] };
 }
 
 /**
@@ -2470,7 +2824,10 @@ export function getMachineMonthlyLoadsByMonth(
   settingsProfile?: CalculationSettingsProfile,
   callOffVolumes?: import('./callOffService.js').CallOffVolumeMaps | null,
   calculationOptions?: CapacityCalculationOptions
-): Map<number, Map<number, { load_percent: number; detail_breakdown: MonthPeakDetail }>> {
+): Map<
+  number,
+  Map<number, { load_percent: number; detail_breakdown: MonthPeakDetail; material_breakdown: MaterialBreakdownItem[] }>
+> {
   const shared = buildCapacityComputeShared(
     year,
     year,
@@ -2479,13 +2836,19 @@ export function getMachineMonthlyLoadsByMonth(
     settingsProfile,
     calculationOptions?.includeRfqOperationIds
   );
-  const byMachine = new Map<number, Map<number, { load_percent: number; detail_breakdown: MonthPeakDetail }>>();
+  const byMachine = new Map<
+    number,
+    Map<number, { load_percent: number; detail_breakdown: MonthPeakDetail; material_breakdown: MaterialBreakdownItem[] }>
+  >();
 
   for (let month = 1; month <= 12; month++) {
     if (callOffVolumes) {
       const weekRange = getSapWeekRangeForMonth(callOffVolumes, year, month);
       if (weekRange) {
-        const weekLoads = new Map<number, { loads: number[]; details: MonthPeakDetail[] }>();
+        const weekLoads = new Map<
+          number,
+          { loads: number[]; details: MonthPeakDetail[]; materials: MaterialBreakdownItem[][] }
+        >();
         for (let w = weekRange.from; w <= weekRange.to; w++) {
           const weekRows = getMachineCapacitiesForYear(
             year,
@@ -2507,27 +2870,30 @@ export function getMachineMonthlyLoadsByMonth(
           );
           for (const row of weekRows) {
             if (!weekLoads.has(row.machine_id)) {
-              weekLoads.set(row.machine_id, { loads: [], details: [] });
+              weekLoads.set(row.machine_id, { loads: [], details: [], materials: [] });
             }
             const bucket = weekLoads.get(row.machine_id)!;
             bucket.loads.push(row.load_percent ?? 0);
             bucket.details.push((row.detail_breakdown ?? []) as MonthPeakDetail);
+            bucket.materials.push(((row as any).material_breakdown ?? []) as MaterialBreakdownItem[]);
           }
         }
         for (const [machineId, bucket] of weekLoads) {
           if (!byMachine.has(machineId)) byMachine.set(machineId, new Map());
           const avg = averageLoadPercent(bucket.loads);
-          const bestDetail = pickDetailBreakdownClosestToLoad(
+          const picked = pickBreakdownsClosestToLoad(
             bucket.loads.map((load_percent, i) => ({
               load_percent,
               detail_breakdown: bucket.details[i] ?? [],
+              material_breakdown: bucket.materials[i] ?? [],
             })),
             avg
           );
           const ww = Math.max(1, shared.settingsByYear.get(year)?.working_weeks_per_year ?? 48);
           byMachine.get(machineId)!.set(month, {
             load_percent: avg,
-            detail_breakdown: convertBreakdownVolumesWeeklyToMonthly(bestDetail, ww),
+            detail_breakdown: convertBreakdownVolumesWeeklyToMonthly(picked.detail_breakdown, ww),
+            material_breakdown: picked.material_breakdown,
           });
         }
         continue;
@@ -2556,6 +2922,7 @@ export function getMachineMonthlyLoadsByMonth(
       byMachine.get(row.machine_id)!.set(month, {
         load_percent: row.load_percent ?? 0,
         detail_breakdown: (row.detail_breakdown ?? []) as MonthPeakDetail,
+        material_breakdown: ((row as any).material_breakdown ?? []) as MaterialBreakdownItem[],
       });
     }
   }
@@ -2579,7 +2946,7 @@ export function getMachineMonthlyAverageLoads(
   dimensionFilters?: MachineDimensionFilter[],
   settingsProfile?: CalculationSettingsProfile,
   callOffVolumes?: import('./callOffService.js').CallOffVolumeMaps | null
-): Map<number, { load_percent: number; detail_breakdown: MonthPeakDetail }> {
+): Map<number, { load_percent: number; detail_breakdown: MonthPeakDetail; material_breakdown: MaterialBreakdownItem[] }> {
   const byMonth = getMachineMonthlyLoadsByMonth(
     year,
     machineIds,
@@ -2596,32 +2963,45 @@ export function getMachineMonthlyAverageLoads(
   const sapMonthRange = callOffVolumes ? getSapMonthRangeForYear(callOffVolumes, year) : { from: 1, to: 12 };
   const monthFrom = sapMonthRange?.from ?? null;
   const monthTo = sapMonthRange?.to ?? null;
-  const averages = new Map<number, { load_percent: number; detail_breakdown: MonthPeakDetail }>();
+  const averages = new Map<
+    number,
+    { load_percent: number; detail_breakdown: MonthPeakDetail; material_breakdown: MaterialBreakdownItem[] }
+  >();
   if (monthFrom == null || monthTo == null) {
     for (const machineId of byMonth.keys()) {
-      averages.set(machineId, { load_percent: 0, detail_breakdown: [] });
+      averages.set(machineId, { load_percent: 0, detail_breakdown: [], material_breakdown: [] });
     }
     return averages;
   }
   for (const [machineId, months] of byMonth) {
     const vals: number[] = [];
-    const monthCandidates: { load_percent: number; detail_breakdown: MonthPeakDetail }[] = [];
+    const monthCandidates: { load_percent: number; detail_breakdown: MonthPeakDetail; material_breakdown: MaterialBreakdownItem[] }[] =
+      [];
     for (let m = monthFrom; m <= monthTo; m++) {
-      const md = months.get(m) ?? { load_percent: 0, detail_breakdown: [] as MonthPeakDetail };
+      const md = months.get(m) ?? {
+        load_percent: 0,
+        detail_breakdown: [] as MonthPeakDetail,
+        material_breakdown: [] as MaterialBreakdownItem[],
+      };
       vals.push(md.load_percent);
       monthCandidates.push({
         load_percent: md.load_percent,
         detail_breakdown: md.detail_breakdown ?? [],
+        material_breakdown: md.material_breakdown ?? [],
       });
     }
     const avg = averageLoadPercent(vals);
-    const bestDetail = pickDetailBreakdownClosestToLoad(monthCandidates, avg);
-    averages.set(machineId, { load_percent: avg, detail_breakdown: bestDetail });
+    const picked = pickBreakdownsClosestToLoad(monthCandidates, avg);
+    averages.set(machineId, {
+      load_percent: avg,
+      detail_breakdown: picked.detail_breakdown,
+      material_breakdown: picked.material_breakdown,
+    });
   }
   // Maszyny bez wpisu w byMonth (brak load w zakresie) — 0%.
   if (machineIds?.length) {
     for (const id of machineIds) {
-      if (!averages.has(id)) averages.set(id, { load_percent: 0, detail_breakdown: [] });
+      if (!averages.has(id)) averages.set(id, { load_percent: 0, detail_breakdown: [], material_breakdown: [] });
     }
   }
   return averages;
@@ -2640,7 +3020,7 @@ export function getMachineMonthlyPeakLoads(
   dimensionFilters?: MachineDimensionFilter[],
   settingsProfile?: CalculationSettingsProfile,
   callOffVolumes?: import('./callOffService.js').CallOffVolumeMaps | null
-): Map<number, { load_percent: number; detail_breakdown: MonthPeakDetail }> {
+): Map<number, { load_percent: number; detail_breakdown: MonthPeakDetail; material_breakdown: MaterialBreakdownItem[] }> {
   return getMachineMonthlyAverageLoads(
     year,
     machineIds,
@@ -2712,11 +3092,14 @@ export function getMachinePeriodBreakdown(
   );
 
   /** month -> machine_id -> { load, detail } — jeden przebieg na miesiąc dla wszystkich maszyn. */
-  const monthByMachine = new Map<number, Record<number, { load_percent: number; detail_breakdown: MonthPeakDetail }>>();
+  const monthByMachine = new Map<
+    number,
+    Record<number, { load_percent: number; detail_breakdown: MonthPeakDetail; material_breakdown: MaterialBreakdownItem[] }>
+  >();
   /** machineId-month-week -> week load (Call offs: osobny wolumen na tydzień). */
   const weekByMachineMonthWeek = new Map<
     string,
-    { load_percent: number; detail_breakdown: MonthPeakDetail }
+    { load_percent: number; detail_breakdown: MonthPeakDetail; material_breakdown: MaterialBreakdownItem[] }
   >();
 
   for (const m of machines) {
@@ -2747,6 +3130,7 @@ export function getMachinePeriodBreakdown(
       bucket[month] = {
         load_percent: row.load_percent ?? 0,
         detail_breakdown: (row.detail_breakdown ?? []) as MonthPeakDetail,
+        material_breakdown: ((row as any).material_breakdown ?? []) as MaterialBreakdownItem[],
       };
     }
 
@@ -2780,6 +3164,7 @@ export function getMachinePeriodBreakdown(
           weekByMachineMonthWeek.set(`${row.machine_id}-${month}-${w}`, {
             load_percent: row.load_percent ?? 0,
             detail_breakdown: (row.detail_breakdown ?? []) as MonthPeakDetail,
+            material_breakdown: ((row as any).material_breakdown ?? []) as MaterialBreakdownItem[],
           });
         }
         // Bez Call offs i bez alokacji od tygodnia: jeden przebieg wystarczy — skopiuj do pozostałych tygodni.
@@ -2789,6 +3174,7 @@ export function getMachinePeriodBreakdown(
               weekByMachineMonthWeek.set(`${row.machine_id}-${month}-${w2}`, {
                 load_percent: row.load_percent ?? 0,
                 detail_breakdown: (row.detail_breakdown ?? []) as MonthPeakDetail,
+                material_breakdown: ((row as any).material_breakdown ?? []) as MaterialBreakdownItem[],
               });
             }
           }
@@ -2805,7 +3191,7 @@ export function getMachinePeriodBreakdown(
     const monthsData = monthByMachine.get(m.machine_id) ?? {};
     const months: Record<number, MachinePeriodMonthBreakdown> = {};
     for (let month = 1; month <= 12; month++) {
-      const md = monthsData[month] ?? { load_percent: 0, detail_breakdown: [] };
+      const md = monthsData[month] ?? { load_percent: 0, detail_breakdown: [], material_breakdown: [] };
       const weeks: MachinePeriodMonthBreakdown['weeks'] = {};
       if (includeWeeks) {
         const weekCount = getWeekCountInMonth(year, month);
@@ -2814,12 +3200,14 @@ export function getMachinePeriodBreakdown(
           weeks[w] = {
             load_percent: wd?.load_percent ?? md.load_percent,
             detail_breakdown: wd?.detail_breakdown ?? md.detail_breakdown ?? [],
+            material_breakdown: wd?.material_breakdown ?? md.material_breakdown ?? [],
           };
         }
       }
       const monthMarker = yearMarkers.months[month] ?? { has_sop: false, has_eop: false };
       let monthLoad = md.load_percent;
       let monthDetail = md.detail_breakdown ?? [];
+      let monthMaterial = md.material_breakdown ?? [];
       // Miesiąc = średnia tygodni w okresie (produkcja: wszystkie tygodnie; Call offs: zakres SAP).
       if (includeWeeks) {
         const weekCount = getWeekCountInMonth(year, month);
@@ -2839,23 +3227,27 @@ export function getMachinePeriodBreakdown(
         if (from <= to) {
           const vals: number[] = [];
           const details: MonthPeakDetail[] = [];
+          const materials: MaterialBreakdownItem[][] = [];
           for (let w = from; w <= to; w++) {
             const wd = weeks[w];
             vals.push(wd?.load_percent ?? 0);
             details.push((wd?.detail_breakdown ?? []) as MonthPeakDetail);
+            materials.push((wd?.material_breakdown ?? []) as MaterialBreakdownItem[]);
           }
           monthLoad = averageLoadPercent(vals);
-          let bestDetail = pickDetailBreakdownClosestToLoad(
+          const picked = pickBreakdownsClosestToLoad(
             vals.map((load_percent, i) => ({
               load_percent,
               detail_breakdown: details[i] ?? [],
+              material_breakdown: materials[i] ?? [],
             })),
             monthLoad
           );
           // Obciążenie miesiąca = średnia tygodni; skład z tygodnia najbliższego średniej.
           // Tooltip miesiąca: szt./mies. — przelicz ilości z tygodniowych (produkcja i Call offs).
           const ww = Math.max(1, shared.settingsByYear.get(year)?.working_weeks_per_year ?? 48);
-          monthDetail = convertBreakdownVolumesWeeklyToMonthly(bestDetail, ww);
+          monthDetail = convertBreakdownVolumesWeeklyToMonthly(picked.detail_breakdown, ww);
+          monthMaterial = picked.material_breakdown;
         }
       }
       months[month] = {
@@ -2864,6 +3256,7 @@ export function getMachinePeriodBreakdown(
         has_sop: monthMarker.has_sop,
         has_eop: monthMarker.has_eop,
         detail_breakdown: monthDetail,
+        material_breakdown: monthMaterial,
       };
     }
     result.push({
@@ -2958,11 +3351,30 @@ function scenarioProjectLookup(snapshot: ScenarioBundle | null | undefined): Map
   return map;
 }
 
-function loadOperationsForBreakdown(operationsOverride?: any[], includeRfqOperationIds?: number[]): any[] {
-  if (operationsOverride) return operationsOverride;
-  const active = db.prepare(`${CAPACITY_OPS_SELECT} WHERE p.status = 'active'`).all() as any[];
-  const rfqOps = loadRfqOperationsByIds(includeRfqOperationIds ?? []);
-  return mergeOperationsById(active, rfqOps);
+function loadOperationsForBreakdown(
+  operationsOverride?: any[],
+  includeRfqOperationIds?: number[],
+  scenarioSnapshot?: ScenarioBundle | null
+): any[] {
+  let operations =
+    operationsOverride ??
+    mergeOperationsById(
+      db.prepare(`${CAPACITY_OPS_SELECT} WHERE p.status = 'active'`).all() as any[],
+      loadRfqOperationsByIds(includeRfqOperationIds ?? [])
+    );
+  const allowedBaselineProjects =
+    operationsOverride != null
+      ? new Set(
+          operationsOverride
+            .map((o: any) => Number(o.project_id))
+            .filter((id: number) => Number.isFinite(id))
+        )
+      : undefined;
+  operations = mergeOperationsById(
+    operations,
+    loadBaselineMaterialDemandOperations(scenarioSnapshot ?? null, allowedBaselineProjects)
+  );
+  return operations;
 }
 
 function resolveScopeMachineIds(
@@ -3085,7 +3497,30 @@ function accumulateScopeBreakdown(
       : resolveSettingsForYear(year, effectiveProfile);
   const refMode = loadReferenceDisplayMode();
   const projectLookup = scenarioProjectLookup(opts.scenarioSnapshot);
-  const operations = loadOperationsForBreakdown(opts.operationsOverride, opts.includeRfqOperationIds);
+  const operations = loadOperationsForBreakdown(
+    opts.operationsOverride,
+    opts.includeRfqOperationIds,
+    opts.scenarioSnapshot
+  );
+  const baselineMaterials = loadBaselineMaterialIndex();
+  const baselineScopeExtVolumes = loadBaselineExternalVolumeIndex();
+  const baselineScopeExtMaterials = loadBaselineExternalMaterialIndex();
+  const scopeMachines = db
+    .prepare(
+      `SELECT id AS machine_id, is_baseline,
+              baseline_weeks_per_year,
+              baseline_max_throughput_kg_h, baseline_max_throughput_unit,
+              baseline_max_speed_m_min, baseline_max_speed_unit,
+              baseline_max_blank_width_mm, baseline_max_blank_width_unit,
+              baseline_min_length_mm,
+              baseline_max_blanks_across
+       FROM machines
+       WHERE id IN (${[...scopeMachineIds].map(() => '?').join(',')})`
+    )
+    .all(...scopeMachineIds) as any[];
+  const scopeMachineById = new Map(
+    scopeMachines.map((machine) => [Number(machine.machine_id), machine])
+  );
   const volumeMap = (() => {
     if (opts.scenarioSnapshot != null) {
       const rows = (opts.scenarioSnapshot.operation_volume_by_year || []).filter((v: any) => Number(v.year) === year) as {
@@ -3152,6 +3587,15 @@ function accumulateScopeBreakdown(
   for (const op of operations) {
     const machineId = Number(op.machine_id);
     if (!scopeMachineIds.has(machineId)) continue;
+    const machine = scopeMachineById.get(machineId);
+    const baseline = Number(machine?.is_baseline) === 1;
+    const machineVolumeSettings = volumeSettingsForMachine(settings, machine);
+    if (
+      baseline !==
+      (op.baseline_inferred_source === BASELINE_INFERRED_OPERATION)
+    ) {
+      continue;
+    }
 
     const opKey = Number(op.operation_id ?? op.id);
     if (!Number.isFinite(opKey)) continue;
@@ -3201,7 +3645,7 @@ function accumulateScopeBreakdown(
     }
     const volValue = resolved.volume_value;
     const volUnit = resolved.volume_unit;
-    const weeklyResolved = resolveWeeklyVolumeFromResolved(volValue, volUnit, settings, {
+    const weeklyResolved = resolveWeeklyVolumeFromResolved(volValue, volUnit, machineVolumeSettings, {
       sop: op.sop ?? '',
       eop: op.eop ?? '',
       year,
@@ -3213,7 +3657,14 @@ function accumulateScopeBreakdown(
     if (weeklyVol <= 1e-9) continue;
 
     const { cycleSeconds, nests } = resolveOperationCycleForCalculator(op);
-    const requiredSecOp = weeklyVol * (cycleSeconds / nests);
+    const requiredSecOp = baseline
+      ? baselineRequiredSeconds(
+          machine,
+          op.detail_designation_id,
+          weeklyVol,
+          baselineMaterials
+        )
+      : weeklyVol * (cycleSeconds / nests);
     if (requiredSecOp <= 1e-9) continue;
 
     const lookup = projectLookup.get(Number(op.project_id));
@@ -3250,6 +3701,18 @@ function accumulateScopeBreakdown(
     detailNode.requiredSec += requiredSecOp;
     if (hasRfq) detailNode.hasRfq = true;
     projectNode.details.set(detailLabel, detailNode);
+  }
+
+  // Materiały z wolumenem zewnętrznym (linia bazowa)
+  for (const machine of [...scopeMachineById.values()].filter((mc) => Number(mc.is_baseline))) {
+    if (!scopeMachineIds.has(Number(machine.machine_id))) continue;
+    const extSec = baselineExternalVolumeRequiredSeconds(
+      machine,
+      year,
+      baselineScopeExtVolumes,
+      baselineScopeExtMaterials
+    );
+    if (extSec > 0) accum.totalRequiredSec += extSec;
   }
 
   return accum;

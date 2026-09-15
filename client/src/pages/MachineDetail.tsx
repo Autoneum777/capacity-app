@@ -12,6 +12,7 @@ import SortableTh from '../components/SortableTh';
 import { useTableSort, sortRows } from '../utils/tableSort';
 import { useI18n } from '../context/I18nContext';
 import { loadColor, type LoadVisualSettings } from '../utils/loadCellColors';
+import BaselineMaterialsSection from '../components/BaselineMaterialsSection';
 
 const defaultLoadVisual: LoadVisualSettings = {
   colorize_load_cells: true,
@@ -49,7 +50,7 @@ export default function MachineDetail() {
   const { id } = useParams();
   const [machine, setMachine] = useState<any>(null);
   const [loading, setLoading] = useState(true);
-  const [tab, setTab] = useState<'opis' | 'alternatywy' | 'projekty' | 'zajetosc'>('opis');
+  const [tab, setTab] = useState<'opis' | 'alternatywy' | 'projekty' | 'materialy' | 'zajetosc'>('opis');
   const [capacityData, setCapacityData] = useState<any>(null);
   const [capacityError, setCapacityError] = useState<string | null>(null);
   const [capacityLoading, setCapacityLoading] = useState(false);
@@ -98,6 +99,13 @@ export default function MachineDetail() {
   }, [id]);
 
   useEffect(() => {
+    if (!machine) return;
+    const baseline = Boolean(Number(machine.is_baseline));
+    if (baseline && tab === 'projekty') setTab('materialy');
+    if (!baseline && tab === 'materialy') setTab('projekty');
+  }, [machine, tab]);
+
+  useEffect(() => {
     api.settings.visual
       .get()
       .then((v) => {
@@ -132,10 +140,13 @@ export default function MachineDetail() {
 
   if (loading || !machine) return <p>{t('common.loading')}</p>;
 
+  const isBaselineMachine = Boolean(Number(machine.is_baseline));
   const tabs = [
     { id: 'opis' as const, label: t('machineDetail.tabDesc') },
     { id: 'alternatywy' as const, label: t('machineDetail.tabAlt') },
-    { id: 'projekty' as const, label: t('machineDetail.tabProjects') },
+    isBaselineMachine
+      ? { id: 'materialy' as const, label: t('machineDetail.tabMaterials') }
+      : { id: 'projekty' as const, label: t('machineDetail.tabProjects') },
     { id: 'zajetosc' as const, label: t('machineDetail.tabOccupancy') },
   ];
 
@@ -179,7 +190,15 @@ export default function MachineDetail() {
             onUpdate={() => api.machines.get(machine.id).then(setMachine)}
           />
         )}
-        {tab === 'projekty' && (
+        {tab === 'materialy' && isBaselineMachine && (
+          <BaselineMaterialsSection
+            machineId={machine.id}
+            maxBlankWidthMm={machine.baseline_max_blank_width_mm}
+            maxBlankWidthUnit={machine.baseline_max_blank_width_unit}
+            minLengthMm={machine.baseline_min_length_mm}
+          />
+        )}
+        {tab === 'projekty' && !isBaselineMachine && (
           <div style={{ background: 'white', padding: '1.5rem', borderRadius: 8, boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }}>
             <h2 style={{ marginTop: 0 }}>{t('machineDetail.tabProjects')}</h2>
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
@@ -312,23 +331,59 @@ function MachineDescForm({
   const [editDepthMm, setEditDepthMm] = useState(machine.depth_mm != null ? String(machine.depth_mm) : '');
   const [editHeightMm, setEditHeightMm] = useState(machine.height_mm != null ? String(machine.height_mm) : '');
   const [editStrokeMm, setEditStrokeMm] = useState(machine.stroke_mm != null ? String(machine.stroke_mm) : '');
+  const [editIsBaseline, setEditIsBaseline] = useState(Boolean(Number(machine.is_baseline)));
+  const [editAvailableHours, setEditAvailableHours] = useState(
+    machine.baseline_available_hours_per_week != null ? String(machine.baseline_available_hours_per_week) : '120'
+  );
+  const [editWeeksPerYear, setEditWeeksPerYear] = useState(
+    machine.baseline_weeks_per_year != null ? String(machine.baseline_weeks_per_year) : '52'
+  );
+  const [editMaxThroughput, setEditMaxThroughput] = useState(
+    machine.baseline_max_throughput_kg_h != null ? String(machine.baseline_max_throughput_kg_h) : ''
+  );
+  const [editMaxThroughputUnit, setEditMaxThroughputUnit] = useState(
+    String(machine.baseline_max_throughput_unit ?? 'kg/h')
+  );
+  const [editMinThroughput, setEditMinThroughput] = useState(
+    machine.baseline_min_throughput_kg_h != null ? String(machine.baseline_min_throughput_kg_h) : ''
+  );
+  const [editMinThroughputUnit, setEditMinThroughputUnit] = useState(
+    String(machine.baseline_min_throughput_unit ?? 'kg/h')
+  );
+  const [editMaxSpeed, setEditMaxSpeed] = useState(
+    machine.baseline_max_speed_m_min != null ? String(machine.baseline_max_speed_m_min) : ''
+  );
+  const [editMaxSpeedUnit, setEditMaxSpeedUnit] = useState(String(machine.baseline_max_speed_unit ?? 'm/min'));
+  const [editMinSpeed, setEditMinSpeed] = useState(
+    machine.baseline_min_speed_m_min != null ? String(machine.baseline_min_speed_m_min) : ''
+  );
+  const [editMinSpeedUnit, setEditMinSpeedUnit] = useState(String(machine.baseline_min_speed_unit ?? 'm/min'));
+  const [editMaxBlankWidth, setEditMaxBlankWidth] = useState(
+    machine.baseline_max_blank_width_mm != null ? String(machine.baseline_max_blank_width_mm) : ''
+  );
+  const [editMaxBlankWidthUnit, setEditMaxBlankWidthUnit] = useState(
+    String(machine.baseline_max_blank_width_unit ?? 'mm')
+  );
+  const [editMinBlankWidth, setEditMinBlankWidth] = useState(
+    machine.baseline_min_blank_width_mm != null ? String(machine.baseline_min_blank_width_mm) : ''
+  );
+  const [editMinBlankWidthUnit, setEditMinBlankWidthUnit] = useState(
+    String(machine.baseline_min_blank_width_unit ?? 'mm')
+  );
+  const [editMinLength, setEditMinLength] = useState(
+    machine.baseline_min_length_mm != null ? String(machine.baseline_min_length_mm) : '650'
+  );
+  const [editMaxBlanksAcross, setEditMaxBlanksAcross] = useState(
+    machine.baseline_max_blanks_across != null ? String(machine.baseline_max_blanks_across) : ''
+  );
+  const [editMaxBlanksAcrossUnit, setEditMaxBlanksAcrossUnit] = useState(
+    String(machine.baseline_max_blanks_across_unit ?? 'szt')
+  );
   const [saving, setSaving] = useState(false);
   const [statusGuard, setStatusGuard] = useState<null | {
     projects: { id: number; client: string; name: string }[];
     target: 'inactive' | 'RFQ';
-    payload: {
-      internal_number: string;
-      sap_number: string | undefined;
-      type: string | undefined;
-      oee_override: number | null;
-      status: MachineEditStatus;
-      machine_usage: number;
-      location: string;
-      width_mm: number | null;
-      depth_mm: number | null;
-      height_mm: number | null;
-      stroke_mm: number | null;
-    };
+    payload: Record<string, unknown>;
   }>(null);
 
   useEffect(() => {
@@ -347,7 +402,60 @@ function MachineDescForm({
     setEditDepthMm(machine.depth_mm != null ? String(machine.depth_mm) : '');
     setEditHeightMm(machine.height_mm != null ? String(machine.height_mm) : '');
     setEditStrokeMm(machine.stroke_mm != null ? String(machine.stroke_mm) : '');
-  }, [machine.id, machine.internal_number, machine.sap_number, machine.type, machine.oee_override, machine.status, machine.machine_usage, machine.location, machine.width_mm, machine.depth_mm, machine.height_mm, machine.stroke_mm]);
+    setEditIsBaseline(Boolean(Number(machine.is_baseline)));
+    setEditAvailableHours(
+      machine.baseline_available_hours_per_week != null ? String(machine.baseline_available_hours_per_week) : '120'
+    );
+    setEditWeeksPerYear(
+      machine.baseline_weeks_per_year != null ? String(machine.baseline_weeks_per_year) : '52'
+    );
+    setEditMaxThroughput(machine.baseline_max_throughput_kg_h != null ? String(machine.baseline_max_throughput_kg_h) : '');
+    setEditMaxThroughputUnit(String(machine.baseline_max_throughput_unit ?? 'kg/h'));
+    setEditMinThroughput(machine.baseline_min_throughput_kg_h != null ? String(machine.baseline_min_throughput_kg_h) : '');
+    setEditMinThroughputUnit(String(machine.baseline_min_throughput_unit ?? 'kg/h'));
+    setEditMaxSpeed(machine.baseline_max_speed_m_min != null ? String(machine.baseline_max_speed_m_min) : '');
+    setEditMaxSpeedUnit(String(machine.baseline_max_speed_unit ?? 'm/min'));
+    setEditMinSpeed(machine.baseline_min_speed_m_min != null ? String(machine.baseline_min_speed_m_min) : '');
+    setEditMinSpeedUnit(String(machine.baseline_min_speed_unit ?? 'm/min'));
+    setEditMaxBlankWidth(machine.baseline_max_blank_width_mm != null ? String(machine.baseline_max_blank_width_mm) : '');
+    setEditMaxBlankWidthUnit(String(machine.baseline_max_blank_width_unit ?? 'mm'));
+    setEditMinBlankWidth(machine.baseline_min_blank_width_mm != null ? String(machine.baseline_min_blank_width_mm) : '');
+    setEditMinBlankWidthUnit(String(machine.baseline_min_blank_width_unit ?? 'mm'));
+    setEditMinLength(machine.baseline_min_length_mm != null ? String(machine.baseline_min_length_mm) : '650');
+    setEditMaxBlanksAcross(machine.baseline_max_blanks_across != null ? String(machine.baseline_max_blanks_across) : '');
+    setEditMaxBlanksAcrossUnit(String(machine.baseline_max_blanks_across_unit ?? 'szt'));
+  }, [
+    machine.id,
+    machine.internal_number,
+    machine.sap_number,
+    machine.type,
+    machine.oee_override,
+    machine.status,
+    machine.machine_usage,
+    machine.location,
+    machine.width_mm,
+    machine.depth_mm,
+    machine.height_mm,
+    machine.stroke_mm,
+    machine.is_baseline,
+    machine.baseline_available_hours_per_week,
+    machine.baseline_weeks_per_year,
+    machine.baseline_max_throughput_kg_h,
+    machine.baseline_max_throughput_unit,
+    machine.baseline_min_throughput_kg_h,
+    machine.baseline_min_throughput_unit,
+    machine.baseline_max_speed_m_min,
+    machine.baseline_max_speed_unit,
+    machine.baseline_min_speed_m_min,
+    machine.baseline_min_speed_unit,
+    machine.baseline_max_blank_width_mm,
+    machine.baseline_max_blank_width_unit,
+    machine.baseline_min_blank_width_mm,
+    machine.baseline_min_blank_width_unit,
+    machine.baseline_min_length_mm,
+    machine.baseline_max_blanks_across,
+    machine.baseline_max_blanks_across_unit,
+  ]);
 
   const parseDimField = (raw: string): number | null => (raw.trim() === '' ? null : Number(raw.replace(',', '.')));
 
@@ -357,19 +465,15 @@ function MachineDescForm({
     return Number.isFinite(n) ? String(n) : t('common.dash');
   };
 
-  const executeSave = (payload: {
-    internal_number: string;
-    sap_number: string | undefined;
-    type: string | undefined;
-    oee_override: number | null;
-    status: MachineEditStatus;
-    machine_usage: number;
-    location: string;
-    width_mm: number | null;
-    depth_mm: number | null;
-    height_mm: number | null;
-    stroke_mm: number | null;
-  }) => {
+  const formatValueWithUnit = (value: unknown, unit: unknown, fallbackUnit: string) => {
+    const formatted = formatDimDisplay(value);
+    if (formatted === t('common.dash')) return formatted;
+    return `${formatted} ${String(unit ?? '').trim() || fallbackUnit}`;
+  };
+
+  const isBaselineMachine = Boolean(Number(machine.is_baseline));
+
+  const executeSave = (payload: Record<string, unknown>) => {
     setSaving(true);
     api.machines
       .update(machine.id, payload)
@@ -408,8 +512,21 @@ function MachineDescForm({
       }
       typeToSend = found.name;
     }
+    const availableHours = Number(editAvailableHours.replace(',', '.'));
+    if (editIsBaseline && (!Number.isFinite(availableHours) || availableHours < 0 || availableHours > 168)) {
+      alert(t('machineDetail.baselineAvailableHoursError'));
+      return;
+    }
+    const weeksPerYear = Number(editWeeksPerYear.replace(',', '.'));
+    if (
+      editIsBaseline &&
+      (!Number.isInteger(weeksPerYear) || weeksPerYear < 1 || weeksPerYear > 53)
+    ) {
+      alert(t('machineDetail.baselineWeeksPerYearError'));
+      return;
+    }
 
-    const payload = {
+    const payload: Record<string, unknown> = {
       internal_number,
       sap_number: editSapNumber.trim() || undefined,
       type: typeToSend || undefined,
@@ -417,10 +534,28 @@ function MachineDescForm({
       status: editStatus,
       machine_usage: editMachineUsage,
       location: lineStored,
-      width_mm: parseDimField(editWidthMm),
-      depth_mm: parseDimField(editDepthMm),
-      height_mm: parseDimField(editHeightMm),
-      stroke_mm: parseDimField(editStrokeMm),
+      is_baseline: editIsBaseline ? 1 : 0,
+      baseline_available_hours_per_week: editIsBaseline ? availableHours : 120,
+      baseline_weeks_per_year: editIsBaseline ? weeksPerYear : 52,
+      width_mm: editIsBaseline ? null : parseDimField(editWidthMm),
+      depth_mm: editIsBaseline ? null : parseDimField(editDepthMm),
+      height_mm: editIsBaseline ? null : parseDimField(editHeightMm),
+      stroke_mm: editIsBaseline ? null : parseDimField(editStrokeMm),
+      baseline_max_throughput_kg_h: editIsBaseline ? parseDimField(editMaxThroughput) : null,
+      baseline_max_throughput_unit: editIsBaseline ? editMaxThroughputUnit : 'kg/h',
+      baseline_min_throughput_kg_h: editIsBaseline ? parseDimField(editMinThroughput) : null,
+      baseline_min_throughput_unit: editIsBaseline ? editMinThroughputUnit : 'kg/h',
+      baseline_max_speed_m_min: editIsBaseline ? parseDimField(editMaxSpeed) : null,
+      baseline_max_speed_unit: editIsBaseline ? editMaxSpeedUnit : 'm/min',
+      baseline_min_speed_m_min: editIsBaseline ? parseDimField(editMinSpeed) : null,
+      baseline_min_speed_unit: editIsBaseline ? editMinSpeedUnit : 'm/min',
+      baseline_max_blank_width_mm: editIsBaseline ? parseDimField(editMaxBlankWidth) : null,
+      baseline_max_blank_width_unit: editIsBaseline ? editMaxBlankWidthUnit : 'mm',
+      baseline_min_blank_width_mm: editIsBaseline ? parseDimField(editMinBlankWidth) : null,
+      baseline_min_blank_width_unit: editIsBaseline ? editMinBlankWidthUnit : 'mm',
+      baseline_min_length_mm: editIsBaseline ? parseDimField(editMinLength) : 650,
+      baseline_max_blanks_across: editIsBaseline ? parseDimField(editMaxBlanksAcross) : null,
+      baseline_max_blanks_across_unit: editIsBaseline ? editMaxBlanksAcrossUnit : 'szt',
     };
 
     const prevStatus = machineStatusFromDb(machine.status);
@@ -449,6 +584,101 @@ function MachineDescForm({
   const usageRounded = Math.round(usageVal * 10) / 10;
 
   const inputStyleWide = { width: 200, padding: '0.35rem' as const };
+  const inputStyleNum = { width: 120, padding: '0.35rem' as const };
+  const renderUnitSelect = (value: string, onChange: (value: string) => void, options: string[]) => (
+    <select value={value} onChange={(e) => onChange(e.target.value)} style={{ padding: '0.35rem', minWidth: 82 }}>
+      {options.map((unit) => (
+        <option key={unit} value={unit}>{unit}</option>
+      ))}
+    </select>
+  );
+
+  const renderBaselineReadonly = () => (
+    <>
+      <p style={{ marginBottom: 6 }}>
+        <strong>{t('machineDetail.baselineMachine')}</strong> {t('common.yes')}
+      </p>
+      <p style={{ margin: '10px 0 6px', fontWeight: 600 }}>{t('machineDetail.baselineSection')}</p>
+      <p style={{ marginBottom: 6 }}>
+        <strong>{t('machineDetail.baselineMaxThroughput')}</strong>{' '}
+        {formatValueWithUnit(machine.baseline_max_throughput_kg_h, machine.baseline_max_throughput_unit, 'kg/h')}
+      </p>
+      <p style={{ marginBottom: 6 }}>
+        <strong>{t('machineDetail.baselineMinThroughput')}</strong>{' '}
+        {formatValueWithUnit(machine.baseline_min_throughput_kg_h, machine.baseline_min_throughput_unit, 'kg/h')}
+      </p>
+      <p style={{ marginBottom: 6 }}>
+        <strong>{t('machineDetail.baselineMaxSpeed')}</strong>{' '}
+        {formatValueWithUnit(machine.baseline_max_speed_m_min, machine.baseline_max_speed_unit, 'm/min')}
+      </p>
+      <p style={{ marginBottom: 6 }}>
+        <strong>{t('machineDetail.baselineMinSpeed')}</strong>{' '}
+        {formatValueWithUnit(machine.baseline_min_speed_m_min, machine.baseline_min_speed_unit, 'm/min')}
+      </p>
+      <p style={{ marginBottom: 6 }}>
+        <strong>{t('machineDetail.baselineMaxBlankWidth')}</strong>{' '}
+        {formatValueWithUnit(machine.baseline_max_blank_width_mm, machine.baseline_max_blank_width_unit, 'mm')}
+      </p>
+      <p style={{ marginBottom: 6 }}>
+        <strong>{t('machineDetail.baselineMinBlankWidth')}</strong>{' '}
+        {formatValueWithUnit(machine.baseline_min_blank_width_mm, machine.baseline_min_blank_width_unit, 'mm')}
+      </p>
+      <p style={{ marginBottom: 6 }}>
+        <strong>{t('machineDetail.baselineMinLength')}</strong>{' '}
+        {formatValueWithUnit(machine.baseline_min_length_mm ?? 650, 'mm', 'mm')}
+      </p>
+      <p style={{ marginBottom: 6 }}>
+        <strong>{t('machineDetail.baselineMaxBlanksAcross')}</strong>{' '}
+        {formatValueWithUnit(machine.baseline_max_blanks_across, machine.baseline_max_blanks_across_unit, 'szt')}
+      </p>
+    </>
+  );
+
+  const renderBaselineEdit = () => (
+    <>
+      <p style={{ margin: '10px 0 6px', fontWeight: 600 }}>{t('machineDetail.baselineSection')}</p>
+      <p style={{ marginBottom: 6, display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+        <strong>{t('machineDetail.baselineMaxThroughput')}</strong>{' '}
+        <input type="number" step="any" min={0} value={editMaxThroughput} onChange={(e) => setEditMaxThroughput(e.target.value)} style={inputStyleNum} />
+        {renderUnitSelect(editMaxThroughputUnit, setEditMaxThroughputUnit, ['kg/h', 't/h'])}
+      </p>
+      <p style={{ marginBottom: 6, display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+        <strong>{t('machineDetail.baselineMinThroughput')}</strong>{' '}
+        <input type="number" step="any" min={0} value={editMinThroughput} onChange={(e) => setEditMinThroughput(e.target.value)} style={inputStyleNum} />
+        {renderUnitSelect(editMinThroughputUnit, setEditMinThroughputUnit, ['kg/h', 't/h'])}
+      </p>
+      <p style={{ marginBottom: 6, display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+        <strong>{t('machineDetail.baselineMaxSpeed')}</strong>{' '}
+        <input type="number" step="any" min={0} value={editMaxSpeed} onChange={(e) => setEditMaxSpeed(e.target.value)} style={inputStyleNum} />
+        {renderUnitSelect(editMaxSpeedUnit, setEditMaxSpeedUnit, ['m/min', 'm/s'])}
+      </p>
+      <p style={{ marginBottom: 6, display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+        <strong>{t('machineDetail.baselineMinSpeed')}</strong>{' '}
+        <input type="number" step="any" min={0} value={editMinSpeed} onChange={(e) => setEditMinSpeed(e.target.value)} style={inputStyleNum} />
+        {renderUnitSelect(editMinSpeedUnit, setEditMinSpeedUnit, ['m/min', 'm/s'])}
+      </p>
+      <p style={{ marginBottom: 6, display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+        <strong>{t('machineDetail.baselineMaxBlankWidth')}</strong>{' '}
+        <input type="number" step="any" min={0} value={editMaxBlankWidth} onChange={(e) => setEditMaxBlankWidth(e.target.value)} style={inputStyleNum} />
+        {renderUnitSelect(editMaxBlankWidthUnit, setEditMaxBlankWidthUnit, ['mm', 'cm'])}
+      </p>
+      <p style={{ marginBottom: 6, display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+        <strong>{t('machineDetail.baselineMinBlankWidth')}</strong>{' '}
+        <input type="number" step="any" min={0} value={editMinBlankWidth} onChange={(e) => setEditMinBlankWidth(e.target.value)} style={inputStyleNum} />
+        {renderUnitSelect(editMinBlankWidthUnit, setEditMinBlankWidthUnit, ['mm', 'cm'])}
+      </p>
+      <p style={{ marginBottom: 6, display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+        <strong>{t('machineDetail.baselineMinLength')}</strong>{' '}
+        <input type="number" step="any" min={0} value={editMinLength} onChange={(e) => setEditMinLength(e.target.value)} style={inputStyleNum} />
+        <span>mm</span>
+      </p>
+      <p style={{ marginBottom: 6, display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+        <strong>{t('machineDetail.baselineMaxBlanksAcross')}</strong>{' '}
+        <input type="number" step="1" min={0} value={editMaxBlanksAcross} onChange={(e) => setEditMaxBlanksAcross(e.target.value)} style={inputStyleNum} />
+        {renderUnitSelect(editMaxBlanksAcrossUnit, setEditMaxBlanksAcrossUnit, ['szt'])}
+      </p>
+    </>
+  );
 
   return (
     <>
@@ -461,11 +691,37 @@ function MachineDescForm({
           <p style={{ marginBottom: 6 }}><strong>{t('machineDetail.type')}</strong> {machine.type ?? t('common.dash')}</p>
           <p style={{ marginBottom: 6 }}><strong>{t('machineDetail.lineNumber')}</strong> {machine.location?.trim() ? machine.location : t('common.dash')}</p>
           <p style={{ marginBottom: 6 }}><strong>{t('machineDetail.oeeOverride')}</strong> {machine.oee_override != null ? machine.oee_override : t('common.dash')}</p>
+          {isBaselineMachine && (
+            <>
+              <p style={{ marginBottom: 6 }}>
+                <strong>{t('machineDetail.baselineAvailableHours')}</strong>{' '}
+                {formatValueWithUnit(
+                  machine.baseline_available_hours_per_week ?? 120,
+                  t('machineDetail.baselineHoursPerWeekUnit'),
+                  t('machineDetail.baselineHoursPerWeekUnit')
+                )}
+              </p>
+              <p style={{ marginBottom: 6 }}>
+                <strong>{t('machineDetail.baselineWeeksPerYear')}</strong>{' '}
+                {formatValueWithUnit(
+                  machine.baseline_weeks_per_year ?? 52,
+                  t('machineDetail.baselineWeeksPerYearUnit'),
+                  t('machineDetail.baselineWeeksPerYearUnit')
+                )}
+              </p>
+            </>
+          )}
           <p style={{ marginBottom: 6 }}><strong>{t('machineDetail.machineUsage')}</strong> {typeof machine.machine_usage === 'number' ? machine.machine_usage : 1}</p>
-          <p style={{ marginBottom: 6 }}><strong>{t('machineDetail.widthMm')}</strong> {formatDimDisplay(machine.width_mm)}</p>
-          <p style={{ marginBottom: 6 }}><strong>{t('machineDetail.depthMm')}</strong> {formatDimDisplay(machine.depth_mm)}</p>
-          <p style={{ marginBottom: 6 }}><strong>{t('machineDetail.heightMm')}</strong> {formatDimDisplay(machine.height_mm)}</p>
-          <p style={{ marginBottom: 6 }}><strong>{t('machineDetail.strokeMm')}</strong> {formatDimDisplay(machine.stroke_mm)}</p>
+          {isBaselineMachine ? (
+            renderBaselineReadonly()
+          ) : (
+            <>
+              <p style={{ marginBottom: 6 }}><strong>{t('machineDetail.widthMm')}</strong> {formatDimDisplay(machine.width_mm)}</p>
+              <p style={{ marginBottom: 6 }}><strong>{t('machineDetail.depthMm')}</strong> {formatDimDisplay(machine.depth_mm)}</p>
+              <p style={{ marginBottom: 6 }}><strong>{t('machineDetail.heightMm')}</strong> {formatDimDisplay(machine.height_mm)}</p>
+              <p style={{ marginBottom: 6 }}><strong>{t('machineDetail.strokeMm')}</strong> {formatDimDisplay(machine.stroke_mm)}</p>
+            </>
+          )}
           <p style={{ marginBottom: 10 }}>
             <strong>{t('machineDetail.statusLabel')}</strong>{' '}
             <span style={machineStatusReadonlyStyle(machine.status)}>{machineStatusReadLabelProjectsParity(machine.status, t)}</span>
@@ -481,6 +737,17 @@ function MachineDescForm({
           <p style={{ marginBottom: 6 }}>
             <strong>{t('machineDetail.internalNumber')}</strong>{' '}
             <input type="text" value={editInternalNumber} onChange={(e) => setEditInternalNumber(e.target.value)} placeholder={t('machines.internalPlaceholder')} style={inputStyleWide} />
+          </p>
+          <p style={{ marginBottom: 6, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <input
+              id="edit-is-baseline"
+              type="checkbox"
+              checked={editIsBaseline}
+              onChange={(e) => setEditIsBaseline(e.target.checked)}
+            />
+            <label htmlFor="edit-is-baseline" style={{ cursor: 'pointer' }}>
+              <strong>{t('machineDetail.baselineMachine')}</strong>
+            </label>
           </p>
           <p style={{ marginBottom: 6 }}>
             <strong>{t('machineDetail.type')}</strong>{' '}
@@ -531,6 +798,36 @@ function MachineDescForm({
             <strong>{t('machineDetail.oeeOverride')}</strong>{' '}
             <input type="number" step="0.01" min={0} max={1} value={editOeeOverride} onChange={(e) => setEditOeeOverride(e.target.value)} style={{ width: 80, padding: '0.35rem' }} placeholder="0.85" />
           </p>
+          {editIsBaseline && (
+            <>
+              <p style={{ marginBottom: 6, display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+                <strong>{t('machineDetail.baselineAvailableHours')}</strong>{' '}
+                <input
+                  type="number"
+                  step="0.1"
+                  min={0}
+                  max={168}
+                  value={editAvailableHours}
+                  onChange={(e) => setEditAvailableHours(e.target.value)}
+                  style={inputStyleNum}
+                />
+                <span>{t('machineDetail.baselineHoursPerWeekUnit')}</span>
+              </p>
+              <p style={{ marginBottom: 6, display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+                <strong>{t('machineDetail.baselineWeeksPerYear')}</strong>{' '}
+                <input
+                  type="number"
+                  step="1"
+                  min={1}
+                  max={53}
+                  value={editWeeksPerYear}
+                  onChange={(e) => setEditWeeksPerYear(e.target.value)}
+                  style={inputStyleNum}
+                />
+                <span>{t('machineDetail.baselineWeeksPerYearUnit')}</span>
+              </p>
+            </>
+          )}
           <p style={{ marginBottom: 6 }}>
             <strong>{t('machineDetail.machineUsage')}</strong>{' '}
             <SearchableSelect value={usageRounded} onChange={(e) => setEditMachineUsage(Number(e.target.value))} style={{ padding: '0.35rem' }}>
@@ -540,22 +837,28 @@ function MachineDescForm({
             </SearchableSelect>
             <span style={{ fontSize: 12, color: '#666', marginLeft: 8 }}>{t('machineDetail.usageHint')}</span>
           </p>
-          <p style={{ marginBottom: 6 }}>
-            <strong>{t('machineDetail.widthMm')}</strong>{' '}
-            <input type="number" step="0.1" min={0} value={editWidthMm} onChange={(e) => setEditWidthMm(e.target.value)} style={{ width: 100, padding: '0.35rem' }} />
-          </p>
-          <p style={{ marginBottom: 6 }}>
-            <strong>{t('machineDetail.depthMm')}</strong>{' '}
-            <input type="number" step="0.1" min={0} value={editDepthMm} onChange={(e) => setEditDepthMm(e.target.value)} style={{ width: 100, padding: '0.35rem' }} />
-          </p>
-          <p style={{ marginBottom: 6 }}>
-            <strong>{t('machineDetail.heightMm')}</strong>{' '}
-            <input type="number" step="0.1" min={0} value={editHeightMm} onChange={(e) => setEditHeightMm(e.target.value)} style={{ width: 100, padding: '0.35rem' }} />
-          </p>
-          <p style={{ marginBottom: 6 }}>
-            <strong>{t('machineDetail.strokeMm')}</strong>{' '}
-            <input type="number" step="0.1" min={0} value={editStrokeMm} onChange={(e) => setEditStrokeMm(e.target.value)} style={{ width: 100, padding: '0.35rem' }} />
-          </p>
+          {editIsBaseline ? (
+            renderBaselineEdit()
+          ) : (
+            <>
+              <p style={{ marginBottom: 6 }}>
+                <strong>{t('machineDetail.widthMm')}</strong>{' '}
+                <input type="number" step="0.1" min={0} value={editWidthMm} onChange={(e) => setEditWidthMm(e.target.value)} style={{ width: 100, padding: '0.35rem' }} />
+              </p>
+              <p style={{ marginBottom: 6 }}>
+                <strong>{t('machineDetail.depthMm')}</strong>{' '}
+                <input type="number" step="0.1" min={0} value={editDepthMm} onChange={(e) => setEditDepthMm(e.target.value)} style={{ width: 100, padding: '0.35rem' }} />
+              </p>
+              <p style={{ marginBottom: 6 }}>
+                <strong>{t('machineDetail.heightMm')}</strong>{' '}
+                <input type="number" step="0.1" min={0} value={editHeightMm} onChange={(e) => setEditHeightMm(e.target.value)} style={{ width: 100, padding: '0.35rem' }} />
+              </p>
+              <p style={{ marginBottom: 6 }}>
+                <strong>{t('machineDetail.strokeMm')}</strong>{' '}
+                <input type="number" step="0.1" min={0} value={editStrokeMm} onChange={(e) => setEditStrokeMm(e.target.value)} style={{ width: 100, padding: '0.35rem' }} />
+              </p>
+            </>
+          )}
           <p style={{ marginBottom: 10 }}>
             <strong>{t('machineDetail.statusLabel')}</strong>{' '}
             <select

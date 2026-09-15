@@ -1,5 +1,10 @@
 import type { ScenarioBundle } from './scenarioSnapshotService.js';
-import { getMachineCapacityByYears, getMachineMonthlyAverageLoads, getMachinePeriodBreakdown } from './capacityService.js';
+import {
+  getMachineCapacityByYears,
+  getMachineMonthlyAverageLoads,
+  getMachinePeriodBreakdown,
+  type MaterialBreakdownItem,
+} from './capacityService.js';
 import type { MachineDimensionFilter } from '../utils/machineDimensionFilter.js';
 import type { MachineStatusFilterInput, CalculationSettingsProfile } from './capacityService.js';
 import { loadCallOffVolumeMaps } from './callOffService.js';
@@ -27,6 +32,30 @@ function mergeAssignedDetailsIntoCallOffBreakdown(
       share_percent: 0,
       volume_quantity: 0,
       has_rfq: d.has_rfq,
+    });
+  }
+  return co.sort((a, b) => b.contribution_percent - a.contribution_percent);
+}
+
+/** Materiały (linie bazowe) ze scenariusza bez wolumenu SAP w okresie — dopisz jako 0% w liście Call offs. */
+function mergeAssignedMaterialsIntoCallOffBreakdown(
+  callOffMaterials: MaterialBreakdownItem[] | undefined,
+  baseMaterials: MaterialBreakdownItem[] | undefined
+): MaterialBreakdownItem[] {
+  const co = [...(callOffMaterials ?? [])];
+  const key = (m: MaterialBreakdownItem) => `${m.material_alias ?? ''}\0${m.material_sap ?? ''}`;
+  const seen = new Set(co.map(key));
+  for (const m of baseMaterials ?? []) {
+    if (seen.has(key(m))) continue;
+    seen.add(key(m));
+    co.push({
+      material_alias: m.material_alias,
+      material_sap: m.material_sap,
+      material_width_mm: m.material_width_mm,
+      material_length_mm: m.material_length_mm,
+      material_grammage_kg_m2: m.material_grammage_kg_m2,
+      contribution_percent: 0,
+      details: [],
     });
   }
   return co.sort((a, b) => b.contribution_percent - a.contribution_percent);
@@ -68,7 +97,13 @@ export function getScenarioCallOffCalculator(
     SCENARIO_BREAKDOWN_OPTS
   );
 
-  const yearAvgByMachine = new Map<number, Map<number, { load_percent: number; detail_breakdown: DetailBreakdownRow }>>();
+  const yearAvgByMachine = new Map<
+    number,
+    Map<
+      number,
+      { load_percent: number; detail_breakdown: DetailBreakdownRow; material_breakdown: MaterialBreakdownItem[] }
+    >
+  >();
   for (let y = yearFrom; y <= yearTo; y++) {
     const averages = getMachineMonthlyAverageLoads(
       y,
@@ -105,6 +140,10 @@ export function getScenarioCallOffCalculator(
         call_off_detail_breakdown: mergeAssignedDetailsIntoCallOffBreakdown(
           avg?.detail_breakdown,
           yData.detail_breakdown as DetailBreakdownRow | undefined
+        ),
+        call_off_material_breakdown: mergeAssignedMaterialsIntoCallOffBreakdown(
+          avg?.material_breakdown,
+          (yData as any).material_breakdown
         ),
       };
     }
@@ -177,6 +216,11 @@ export function getScenarioCallOffPeriodBreakdown(
             coWeek?.detail_breakdown as DetailBreakdownRow | undefined,
             wd.detail_breakdown as DetailBreakdownRow | undefined
           ),
+          material_breakdown: (wd as any).material_breakdown ?? [],
+          call_off_material_breakdown: mergeAssignedMaterialsIntoCallOffBreakdown(
+            (coWeek as any)?.material_breakdown,
+            (wd as any).material_breakdown
+          ),
         };
       }
       months[month] = {
@@ -189,6 +233,11 @@ export function getScenarioCallOffPeriodBreakdown(
         call_off_detail_breakdown: mergeAssignedDetailsIntoCallOffBreakdown(
           coMd?.detail_breakdown as DetailBreakdownRow | undefined,
           md.detail_breakdown as DetailBreakdownRow | undefined
+        ),
+        material_breakdown: (md as any).material_breakdown ?? [],
+        call_off_material_breakdown: mergeAssignedMaterialsIntoCallOffBreakdown(
+          (coMd as any)?.material_breakdown,
+          (md as any).material_breakdown
         ),
       };
     }

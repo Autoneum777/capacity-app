@@ -4482,7 +4482,7 @@ function AllocationModal({
     () => groupedOperations.filter((g) => selectedGroupKeys.includes(g.key)),
     [groupedOperations, selectedGroupKeys]
   );
-  const opId: number | '' = selectedGroups[0]?.representativeId ?? '';
+  const opId: number | '' = selectedGroups.length > 0 ? selectedGroups[0].representativeId : '';
   const selectedGroupKeySet = useMemo(() => new Set(selectedGroupKeys), [selectedGroupKeys]);
 
   useEffect(() => {

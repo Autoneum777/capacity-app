@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type ErrorRequestHandler, type Request, type Response } from 'express';
 import fs from 'fs';
 import path from 'path';
 import multer from 'multer';
@@ -44,10 +44,33 @@ import type { OcuColumnLetters } from '../services/ocuColumnMapping.js';
 
 export const adminRouter = Router();
 
+// Pełne eksporty (Excel „bazy” ze wszystkimi tabelami, w tym call_off_volumes z dziesiątkami tysięcy wierszy)
+// bywają duże — 40 MB było zbyt wąskim limitem i przy przekroczeniu multer zwracał gołe
+// „Internal Server Error” (patrz multerErrorMiddleware poniżej — bez niego błąd multera nie trafiał do JSON-a).
 const capacityUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 40 * 1024 * 1024 },
+  limits: { fileSize: 200 * 1024 * 1024 },
 });
+
+/**
+ * Błąd multera (np. limit rozmiaru pliku) rzucany jest w middleware PRZED naszym handlerem trasy —
+ * bez tej funkcji trafiał do domyślnego handlera Express i klient widział gołe „Internal Server Error”
+ * (bez treści JSON). Rejestrować jako kolejny argument tras:
+ * `.post(path, capacityUpload.single('file'), multerErrorMiddleware, handler)`.
+ */
+const multerErrorMiddleware: ErrorRequestHandler = (err, _req, res, next) => {
+  if (!err) return next();
+  if (err instanceof multer.MulterError) {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      res.status(413).json({ error: 'Plik jest za duży (limit dla tego importu). Zmniejsz plik i spróbuj ponownie.' });
+      return;
+    }
+    res.status(400).json({ error: `Błąd wgrywania pliku (${err.code}): ${err.message}` });
+    return;
+  }
+  console.error('[admin] Nieoczekiwany błąd przy wgrywaniu pliku:', err);
+  res.status(500).json({ error: err?.message || 'Błąd wgrywania pliku.' });
+};
 
 /** Pola multipart muszą być wysłane przed dużym `file`, inaczej bywa puste — patrz importCapacityBundle w kliencie. */
 function parseOnlyTablesFromBody(body: Record<string, unknown> | undefined): string[] | undefined {
@@ -485,21 +508,26 @@ adminRouter.get('/capacity-bundle-template.xlsx', (req, res) => {
  * Import z uzupełnionego szablonu: multipart field `file` + `confirm` = IMPORTUJ_BAZE.
  * Opcjonalnie `onlyTables` (JSON array nazw tabel) — import częściowy tylko tych arkuszy.
  */
-adminRouter.post('/capacity-bundle-import', capacityUpload.single('file'), (req, res) => {
-  const confirm = String((req.body as { confirm?: string })?.confirm ?? '').trim();
-  if (confirm !== 'IMPORTUJ_BAZE') {
-    return res.status(400).json({
-      error: 'Potwierdź import: wyślij pole formularza confirm o wartości dokładnie IMPORTUJ_BAZE.',
-    });
+adminRouter.post('/capacity-bundle-import', capacityUpload.single('file'), multerErrorMiddleware, (req: Request, res: Response) => {
+  try {
+    const confirm = String((req.body as { confirm?: string })?.confirm ?? '').trim();
+    if (confirm !== 'IMPORTUJ_BAZE') {
+      return res.status(400).json({
+        error: 'Potwierdź import: wyślij pole formularza confirm o wartości dokładnie IMPORTUJ_BAZE.',
+      });
+    }
+    const f = req.file;
+    if (!f?.buffer?.length) return res.status(400).json({ error: 'Brak pliku .xlsx (pole formularza: file).' });
+
+    const onlyTables = parseOnlyTablesFromBody(req.body as Record<string, unknown>);
+
+    const result = importCapacityBundleFromBuffer(f.buffer, onlyTables?.length ? { onlyTables } : undefined);
+    if (!result.ok) return res.status(400).json({ error: result.error });
+    res.json(result);
+  } catch (e: any) {
+    console.error('[capacity-bundle-import] Nieoczekiwany wyjątek:', e);
+    if (!res.headersSent) res.status(500).json({ error: e?.message || 'Import bazy zakończył się nieoczekiwanym błędem serwera.' });
   }
-  const f = req.file;
-  if (!f?.buffer?.length) return res.status(400).json({ error: 'Brak pliku .xlsx (pole formularza: file).' });
-
-  const onlyTables = parseOnlyTablesFromBody(req.body as Record<string, unknown>);
-
-  const result = importCapacityBundleFromBuffer(f.buffer, onlyTables?.length ? { onlyTables } : undefined);
-  if (!result.ok) return res.status(400).json({ error: result.error });
-  res.json(result);
 });
 
 /** Statyczny opis szablonu zwracanego przez capacity-data-template.xlsx — bez generowania pliku (łatwa weryfikacja w przeglądarce). */
@@ -544,61 +572,77 @@ adminRouter.get('/capacity-data-template.xlsx', (_req, res) => {
 /** Wyczyszczenie danych aplikacji: confirm = WYCZYSC_BAZE; opcjonalnie create_backup = true. */
 adminRouter.post('/clear-database', (req, res) => {
   void (async () => {
-    const body = req.body as { confirm?: string; create_backup?: boolean | number | string };
-    const confirm = String(body.confirm ?? '').trim();
-    if (confirm !== 'WYCZYSC_BAZE') {
-      return res.status(400).json({
-        error: 'Potwierdź czyszczenie: wyślij pole confirm o wartości dokładnie WYCZYSC_BAZE.',
-      });
-    }
-    const createBackup =
-      body.create_backup === true || body.create_backup === 1 || body.create_backup === '1' || body.create_backup === 'true';
-    let backupBefore: { filePath: string; at: string } | undefined;
-    if (createBackup) {
-      try {
-        backupBefore = await performDatabaseBackup('manual');
-      } catch (e: any) {
-        return res.status(500).json({
-          error: e?.message || 'Nie udało się utworzyć kopii zapasowej przed wyczyszczeniem. Operacja anulowana.',
+    try {
+      const body = req.body as { confirm?: string; create_backup?: boolean | number | string };
+      const confirm = String(body.confirm ?? '').trim();
+      if (confirm !== 'WYCZYSC_BAZE') {
+        return res.status(400).json({
+          error: 'Potwierdź czyszczenie: wyślij pole confirm o wartości dokładnie WYCZYSC_BAZE.',
         });
       }
+      const createBackup =
+        body.create_backup === true || body.create_backup === 1 || body.create_backup === '1' || body.create_backup === 'true';
+      let backupBefore: { filePath: string; at: string } | undefined;
+      if (createBackup) {
+        try {
+          backupBefore = await performDatabaseBackup('manual');
+        } catch (e: any) {
+          return res.status(500).json({
+            error: e?.message || 'Nie udało się utworzyć kopii zapasowej przed wyczyszczeniem. Operacja anulowana.',
+          });
+        }
+      }
+      const result = clearApplicationDatabase();
+      if (!result.ok) return res.status(500).json({ error: result.error });
+      res.json({
+        ok: true,
+        cleared_at: new Date().toISOString(),
+        tables_cleared: result.tables_cleared,
+        rows_deleted: result.rows_deleted,
+        backup_file: backupBefore?.filePath,
+        backup_at: backupBefore?.at,
+      });
+    } catch (e: any) {
+      console.error('[clear-database] Nieoczekiwany wyjątek:', e);
+      if (!res.headersSent) res.status(500).json({ error: e?.message || 'Czyszczenie bazy się nie powiodło.' });
     }
-    const result = clearApplicationDatabase();
-    if (!result.ok) return res.status(500).json({ error: result.error });
-    res.json({
-      ok: true,
-      cleared_at: new Date().toISOString(),
-      tables_cleared: result.tables_cleared,
-      rows_deleted: result.rows_deleted,
-      backup_file: backupBefore?.filePath,
-      backup_at: backupBefore?.at,
-    });
   })();
 });
 
-adminRouter.post('/capacity-data-import', capacityUpload.single('file'), (req, res) => {
+adminRouter.post('/capacity-data-import', capacityUpload.single('file'), multerErrorMiddleware, (req: Request, res: Response) => {
   void (async () => {
-    const confirm = String((req.body as { confirm?: string })?.confirm ?? '').trim();
-    if (confirm !== 'IMPORTUJ_DANE') {
-      return res.status(400).json({
-        error: 'Potwierdź import: wyślij pole confirm o wartości dokładnie IMPORTUJ_DANE.',
-      });
-    }
-    const f = req.file;
-    if (!f?.buffer?.length) return res.status(400).json({ error: 'Brak pliku .xlsx (pole formularza: file).' });
-    let backupBefore: { filePath: string; at: string };
     try {
-      backupBefore = await performDatabaseBackup('before_data_import');
+      const confirm = String((req.body as { confirm?: string })?.confirm ?? '').trim();
+      if (confirm !== 'IMPORTUJ_DANE') {
+        return res.status(400).json({
+          error: 'Potwierdź import: wyślij pole confirm o wartości dokładnie IMPORTUJ_DANE.',
+        });
+      }
+      const f = req.file;
+      if (!f?.buffer?.length) return res.status(400).json({ error: 'Brak pliku .xlsx (pole formularza: file).' });
+      let backupBefore: { filePath: string; at: string };
+      try {
+        backupBefore = await performDatabaseBackup('before_data_import');
+      } catch (e: any) {
+        return res.status(500).json({
+          error: e?.message || 'Nie udało się utworzyć kopii zapasowej przed importem. Import anulowany.',
+        });
+      }
+      const modeRaw = String((req.body as { mode?: string })?.mode ?? 'merge').trim().toLowerCase();
+      const mode = modeRaw === 'replace' ? 'replace' : 'merge';
+      let result: ReturnType<typeof importCapacityDataFromBuffer>;
+      try {
+        result = importCapacityDataFromBuffer(f.buffer, { mode });
+      } catch (e: any) {
+        console.error('[capacity-data-import] Nieoczekiwany wyjątek podczas importu:', e);
+        return res.status(500).json({ error: e?.message || 'Import danych zakończył się nieoczekiwanym błędem serwera.' });
+      }
+      if (!result.ok) return res.status(400).json({ error: result.error });
+      res.json({ ...result, backup_file: backupBefore.filePath, backup_at: backupBefore.at });
     } catch (e: any) {
-      return res.status(500).json({
-        error: e?.message || 'Nie udało się utworzyć kopii zapasowej przed importem. Import anulowany.',
-      });
+      console.error('[capacity-data-import] Nieoczekiwany wyjątek w handlerze:', e);
+      if (!res.headersSent) res.status(500).json({ error: e?.message || 'Import danych się nie powiódł.' });
     }
-    const modeRaw = String((req.body as { mode?: string })?.mode ?? 'merge').trim().toLowerCase();
-    const mode = modeRaw === 'replace' ? 'replace' : 'merge';
-    const result = importCapacityDataFromBuffer(f.buffer, { mode });
-    if (!result.ok) return res.status(400).json({ error: result.error });
-    res.json({ ...result, backup_file: backupBefore.filePath, backup_at: backupBefore.at });
   })();
 });
 
@@ -613,27 +657,38 @@ adminRouter.get('/machines-import-template.xlsx', (_req, res) => {
   }
 });
 
-adminRouter.post('/machines-import', capacityUpload.single('file'), (req, res) => {
+adminRouter.post('/machines-import', capacityUpload.single('file'), multerErrorMiddleware, (req: Request, res: Response) => {
   void (async () => {
-    const confirm = String((req.body as { confirm?: string })?.confirm ?? '').trim();
-    if (confirm !== MACHINES_IMPORT_CONFIRM) {
-      return res.status(400).json({
-        error: `Potwierdź import: wyślij pole confirm o wartości dokładnie ${MACHINES_IMPORT_CONFIRM}.`,
-      });
-    }
-    const f = req.file;
-    if (!f?.buffer?.length) return res.status(400).json({ error: 'Brak pliku .xlsx (pole formularza: file).' });
-    let backupBefore: { filePath: string; at: string };
     try {
-      backupBefore = await performDatabaseBackup('before_machines_import');
+      const confirm = String((req.body as { confirm?: string })?.confirm ?? '').trim();
+      if (confirm !== MACHINES_IMPORT_CONFIRM) {
+        return res.status(400).json({
+          error: `Potwierdź import: wyślij pole confirm o wartości dokładnie ${MACHINES_IMPORT_CONFIRM}.`,
+        });
+      }
+      const f = req.file;
+      if (!f?.buffer?.length) return res.status(400).json({ error: 'Brak pliku .xlsx (pole formularza: file).' });
+      let backupBefore: { filePath: string; at: string };
+      try {
+        backupBefore = await performDatabaseBackup('before_machines_import');
+      } catch (e: any) {
+        return res.status(500).json({
+          error: e?.message || 'Nie udało się utworzyć kopii zapasowej przed importem. Import anulowany.',
+        });
+      }
+      let result: ReturnType<typeof importMachinesFromBuffer>;
+      try {
+        result = importMachinesFromBuffer(f.buffer);
+      } catch (e: any) {
+        console.error('[machines-import] Nieoczekiwany wyjątek podczas importu:', e);
+        return res.status(500).json({ error: e?.message || 'Import maszyn zakończył się nieoczekiwanym błędem serwera.' });
+      }
+      if (!result.ok) return res.status(400).json({ error: result.error });
+      res.json({ ...result, backup_file: backupBefore.filePath, backup_at: backupBefore.at });
     } catch (e: any) {
-      return res.status(500).json({
-        error: e?.message || 'Nie udało się utworzyć kopii zapasowej przed importem. Import anulowany.',
-      });
+      console.error('[machines-import] Nieoczekiwany wyjątek w handlerze:', e);
+      if (!res.headersSent) res.status(500).json({ error: e?.message || 'Import maszyn się nie powiódł.' });
     }
-    const result = importMachinesFromBuffer(f.buffer);
-    if (!result.ok) return res.status(400).json({ error: result.error });
-    res.json({ ...result, backup_file: backupBefore.filePath, backup_at: backupBefore.at });
   })();
 });
 
@@ -649,7 +704,8 @@ const ocuUpload = multer({
 adminRouter.post(
   '/ocu-data/preview-headers',
   ocuUpload.fields([{ name: 'katowice', maxCount: 1 }]),
-  (req, res) => {
+  multerErrorMiddleware,
+  (req: Request, res: Response) => {
     void (async () => {
       try {
         const files = req.files as { katowice?: Express.Multer.File[] } | undefined;
@@ -692,7 +748,8 @@ adminRouter.post(
     { name: 'katowice', maxCount: 1 },
     { name: 'routing', maxCount: 1 },
   ]),
-  (req, res) => {
+  multerErrorMiddleware,
+  (req: Request, res: Response) => {
     void (async () => {
       try {
         const files = req.files as

@@ -1,4 +1,5 @@
-import express from 'express';
+import express, { type ErrorRequestHandler } from 'express';
+import multer from 'multer';
 import cors from 'cors';
 import compression from 'compression';
 import fs from 'fs';
@@ -97,6 +98,35 @@ function mountClientStatic(): void {
 }
 
 mountClientStatic();
+
+/**
+ * Siatka bezpieczeństwa — bez tego jakikolwiek nieobsłużony wyjątek w trasie/middleware (w tym błąd
+ * multera rzucony poza specyficznymi handlerami trasy) trafia do domyślnego handlera Express, który
+ * odpowiada gołym „Internal Server Error” (HTML, bez JSON) — klient nie ma się czego uchwycić.
+ * Musi być zarejestrowany jako OSTATNI middleware.
+ */
+const globalErrorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
+  if (res.headersSent) return;
+  if (err instanceof multer.MulterError) {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      res.status(413).json({ error: 'Plik jest za duży (limit dla tego importu). Zmniejsz plik i spróbuj ponownie.' });
+      return;
+    }
+    res.status(400).json({ error: `Błąd wgrywania pliku (${err.code}): ${err.message}` });
+    return;
+  }
+  console.error('[capacity] Nieobsłużony błąd serwera:', err);
+  res.status(500).json({ error: err?.message || 'Nieoczekiwany błąd serwera.' });
+};
+app.use(globalErrorHandler);
+
+/** Log bez ubijania procesu — lepiej zwrócić 500 na jednym żądaniu niż zrestartować cały serwer. */
+process.on('unhandledRejection', (reason) => {
+  console.error('[capacity] Unhandled promise rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[capacity] Uncaught exception:', err);
+});
 
 const PORT = process.env.PORT || 3001;
 

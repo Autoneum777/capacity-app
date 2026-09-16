@@ -4,7 +4,7 @@ const ENV_API = (import.meta.env.VITE_API_BASE ?? '').toString().trim().replace(
 const BASE = ENV_API || '/api';
 
 /** Zgodny z `CAPACITY_DATA_IMPORT_SCHEMA_TAG` na backendzie — weryfikacja pobranego szablonu. */
-export const CAPACITY_DATA_IMPORT_SCHEMA_EXPECTED = 'operacje-v2';
+export const CAPACITY_DATA_IMPORT_SCHEMA_EXPECTED = 'operacje-v3';
 export const MACHINES_IMPORT_CONFIRM = 'IMPORTUJ_MASZYNY';
 
 function mapFetchFailure(e: unknown): Error {
@@ -21,6 +21,22 @@ function isLikelyApiUnreachable(res: Response, data: unknown): boolean {
   const err = (data as { error?: string }).error;
   if (err) return false;
   return res.statusText === 'Internal Server Error' || res.statusText === '';
+}
+
+/**
+ * Zamienia goły `res.statusText` (np. „Internal Server Error”/„Payload Too Large” bez treści JSON —
+ * zwykle błąd multera lub inny wyjątek, który nie trafił do naszego handlera JSON) na komunikat,
+ * który podaje użytkownikowi konkretny następny krok.
+ */
+function friendlyHttpError(res: Response, apiErr?: string | null): Error {
+  if (apiErr) return new Error(apiErr);
+  if (res.status === 413) return new Error('Plik jest za duży dla tego importu — zmniejsz plik i spróbuj ponownie.');
+  if (res.status >= 500) {
+    return new Error(
+      `Serwer zwrócił błąd (HTTP ${res.status}) bez opisu. Sprawdź konsolę serwera backend (okno „npm run dev” w katalogu server) — tam jest pełny opis błędu.`,
+    );
+  }
+  return new Error(res.statusText || `HTTP ${res.status}`);
 }
 
 /** Build query string only from defined, non-empty params (no "undefined" in URL). */
@@ -339,7 +355,7 @@ export const api = {
       }
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error((data as { error?: string }).error || res.statusText || 'OCU generate failed');
+        throw friendlyHttpError(res, (data as { error?: string }).error);
       }
       const statsHeader = res.headers.get('X-OCU-Stats');
       let stats = {
@@ -404,7 +420,7 @@ export const api = {
       }
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error((data as { error?: string }).error || res.statusText || 'OCU preview failed');
+        throw friendlyHttpError(res, (data as { error?: string }).error);
       }
       return res.json() as Promise<{
         headerRowNum: number;
@@ -476,7 +492,7 @@ export const api = {
       }
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error((data as { error?: string }).error || res.statusText);
+        throw friendlyHttpError(res, (data as { error?: string }).error);
       }
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
@@ -502,7 +518,7 @@ export const api = {
         throw mapFetchFailure(e);
       }
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error((data as { error?: string }).error || res.statusText);
+      if (!res.ok) throw friendlyHttpError(res, (data as { error?: string }).error);
       return data as { ok: boolean; tables_imported: string[]; rows_counts: Record<string, number>; partial: boolean };
     },
     /** Diagnostyka: czy backend ma endpoint szablonu v2 (`operacje-v2`). */
@@ -558,7 +574,7 @@ export const api = {
               'Endpoint importu danych nie został znaleziony (404). Zrestartuj serwer backend (w katalogu server: npm run dev) i odśwież stronę.',
           );
         }
-        throw new Error(apiErr || res.statusText);
+        throw friendlyHttpError(res, apiErr);
       }
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
@@ -599,7 +615,7 @@ export const api = {
               'Endpoint importu danych nie został znaleziony (404). Zrestartuj serwer backend (w katalogu server: npm run dev).',
           );
         }
-        throw new Error(apiErr || res.statusText);
+        throw friendlyHttpError(res, apiErr);
       }
       return data as {
         ok: boolean;
@@ -638,7 +654,7 @@ export const api = {
       }
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error((data as { error?: string }).error || res.statusText);
+        throw friendlyHttpError(res, (data as { error?: string }).error);
       }
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
@@ -659,7 +675,7 @@ export const api = {
         throw mapFetchFailure(e);
       }
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error((data as { error?: string }).error || res.statusText);
+      if (!res.ok) throw friendlyHttpError(res, (data as { error?: string }).error);
       return data as {
         ok: boolean;
         created: number;
@@ -1059,7 +1075,7 @@ export const api = {
         throw mapFetchFailure(e);
       }
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error((data as { error?: string }).error || res.statusText);
+      if (!res.ok) throw friendlyHttpError(res, (data as { error?: string }).error);
       return data;
     },
     deleteAttachment: (projectId: number, attachmentId: number) =>
@@ -1674,7 +1690,7 @@ export const api = {
         cache: 'no-store',
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error((data as { error?: string }).error || res.statusText);
+      if (!res.ok) throw friendlyHttpError(res, (data as { error?: string }).error);
       return data as {
         id: number;
         name: string;
@@ -1705,7 +1721,7 @@ export const api = {
       }
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error((data as { error?: string }).error || res.statusText);
+        throw friendlyHttpError(res, (data as { error?: string }).error);
       }
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
@@ -1724,7 +1740,7 @@ export const api = {
       }
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error((data as { error?: string }).error || res.statusText);
+        throw friendlyHttpError(res, (data as { error?: string }).error);
       }
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
@@ -1755,7 +1771,7 @@ export const api = {
         cache: 'no-store',
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error((data as { error?: string }).error || res.statusText);
+      if (!res.ok) throw friendlyHttpError(res, (data as { error?: string }).error);
       return data;
     },
     calculator: (id: number, params?: Record<string, string | number | boolean | undefined | null>) =>

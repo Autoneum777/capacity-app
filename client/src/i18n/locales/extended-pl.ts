@@ -667,7 +667,9 @@ export const extendedPl: TranslationTree = {
     machinesImportErrors: 'błędy',
     bundleTitle: 'Szablon Excel — eksport / import całej bazy danych',
     bundleIntro:
-      'Pobierz paczkę ZIP z danymi Capacity (Excel + scenarios + call-offs). Konta, role i hasła nigdy nie są eksportowane ani importowane — także gdy stary plik Excel nadal ma arkusze users/roles (są ignorowane). Pełne odtworzenie Call offs/snapshotów — przez backup ZIP. Przed importem wykonaj backup.',
+      'Pobierz paczkę ZIP z danymi Capacity (Excel + scenarios + call-offs). Konta, role i hasła nigdy nie są eksportowane ani importowane — także gdy stary plik Excel nadal ma arkusze users/roles (są ignorowane). Możesz wgrać poniżej sam plik .xlsx (tylko dane tabel) albo całą pobraną paczkę .zip — wtedy odtworzone zostaną też duże snapshoty scenariuszy oraz katalog call-offs (pliki źródłowe). Przed importem wykonaj backup.',
+    bundleFileLabel: 'Plik .xlsx lub .zip (pełna paczka):',
+    bundleFileHint: 'Sam .xlsx importuje tylko dane tabel. Pełna paczka .zip odtwarza też scenariusze (duże snapshoty) i katalog call-offs.',
     importScope: 'Zakres importu:',
     importFull: 'Pełny (wszystkie tabele z szablonu — jak dotąd)',
     importPartial: 'Częściowy — tylko wybrane tabele',

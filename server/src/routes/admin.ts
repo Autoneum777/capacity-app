@@ -22,6 +22,8 @@ import {
   buildCapacityBundlePackageBuffer,
   clearApplicationDatabase,
   importCapacityBundleFromBuffer,
+  importCapacityBundlePackageFromZipBuffer,
+  isCapacityBundlePackage,
 } from '../services/capacityBundleService.js';
 import {
   buildCapacityDataImportTemplateBuffer,
@@ -509,26 +511,70 @@ adminRouter.get('/capacity-bundle-template.xlsx', (req, res) => {
  * Opcjonalnie `onlyTables` (JSON array nazw tabel) — import częściowy tylko tych arkuszy.
  */
 adminRouter.post('/capacity-bundle-import', capacityUpload.single('file'), multerErrorMiddleware, (req: Request, res: Response) => {
-  try {
-    const confirm = String((req.body as { confirm?: string })?.confirm ?? '').trim();
-    if (confirm !== 'IMPORTUJ_BAZE') {
-      return res.status(400).json({
-        error: 'Potwierdź import: wyślij pole formularza confirm o wartości dokładnie IMPORTUJ_BAZE.',
-      });
+  void (async () => {
+    try {
+      const confirm = String((req.body as { confirm?: string })?.confirm ?? '').trim();
+      if (confirm !== 'IMPORTUJ_BAZE') {
+        return res.status(400).json({
+          error: 'Potwierdź import: wyślij pole formularza confirm o wartości dokładnie IMPORTUJ_BAZE.',
+        });
+      }
+      const f = req.file;
+      if (!f?.buffer?.length) return res.status(400).json({ error: 'Brak pliku .xlsx (pole formularza: file).' });
+
+      const onlyTables = parseOnlyTablesFromBody(req.body as Record<string, unknown>);
+      const opts = onlyTables?.length ? { onlyTables } : undefined;
+
+      // Wgrana paczka ZIP (Excel + scenarios/ + call-offs/) — obsłuż ją tak jak /capacity-bundle-import-zip,
+      // żeby starszy klient wysyłający ZIP na tę trasę nie dostawał błędu SheetJS „Unsupported ZIP file”.
+      const result = (await isCapacityBundlePackage(f.buffer))
+        ? await importCapacityBundlePackageFromZipBuffer(f.buffer, opts)
+        : importCapacityBundleFromBuffer(f.buffer, opts);
+      if (!result.ok) return res.status(400).json({ error: result.error });
+      res.json(result);
+    } catch (e: any) {
+      console.error('[capacity-bundle-import] Nieoczekiwany wyjątek:', e);
+      if (!res.headersSent) res.status(500).json({ error: e?.message || 'Import bazy zakończył się nieoczekiwanym błędem serwera.' });
     }
-    const f = req.file;
-    if (!f?.buffer?.length) return res.status(400).json({ error: 'Brak pliku .xlsx (pole formularza: file).' });
-
-    const onlyTables = parseOnlyTablesFromBody(req.body as Record<string, unknown>);
-
-    const result = importCapacityBundleFromBuffer(f.buffer, onlyTables?.length ? { onlyTables } : undefined);
-    if (!result.ok) return res.status(400).json({ error: result.error });
-    res.json(result);
-  } catch (e: any) {
-    console.error('[capacity-bundle-import] Nieoczekiwany wyjątek:', e);
-    if (!res.headersSent) res.status(500).json({ error: e?.message || 'Import bazy zakończył się nieoczekiwanym błędem serwera.' });
-  }
+  })();
 });
+
+/**
+ * Import z pełnej paczki ZIP (jak pobrana z `/capacity-bundle-template.xlsx`): Excel + scenarios/*.json + call-offs/.
+ * W przeciwieństwie do `/capacity-bundle-import` (tylko .xlsx) odtwarza też duże snapshoty scenariuszy
+ * (marker `__FILE__:...` w komórce Excela) i katalog plików źródłowych call-offs.
+ * multipart field `file` (.zip) + `confirm` = IMPORTUJ_BAZE. Opcjonalnie `onlyTables`.
+ */
+adminRouter.post(
+  '/capacity-bundle-import-zip',
+  capacityUpload.single('file'),
+  multerErrorMiddleware,
+  (req: Request, res: Response) => {
+    void (async () => {
+      try {
+        const confirm = String((req.body as { confirm?: string })?.confirm ?? '').trim();
+        if (confirm !== 'IMPORTUJ_BAZE') {
+          return res.status(400).json({
+            error: 'Potwierdź import: wyślij pole formularza confirm o wartości dokładnie IMPORTUJ_BAZE.',
+          });
+        }
+        const f = req.file;
+        if (!f?.buffer?.length) return res.status(400).json({ error: 'Brak pliku .zip (pole formularza: file).' });
+
+        const onlyTables = parseOnlyTablesFromBody(req.body as Record<string, unknown>);
+
+        const result = await importCapacityBundlePackageFromZipBuffer(f.buffer, onlyTables?.length ? { onlyTables } : undefined);
+        if (!result.ok) return res.status(400).json({ error: result.error });
+        res.json(result);
+      } catch (e: any) {
+        console.error('[capacity-bundle-import-zip] Nieoczekiwany wyjątek:', e);
+        if (!res.headersSent) {
+          res.status(500).json({ error: e?.message || 'Import paczki ZIP zakończył się nieoczekiwanym błędem serwera.' });
+        }
+      }
+    })();
+  }
+);
 
 /** Statyczny opis szablonu zwracanego przez capacity-data-template.xlsx — bez generowania pliku (łatwa weryfikacja w przeglądarce). */
 adminRouter.get('/capacity-data-template-info.json', (_req, res) => {

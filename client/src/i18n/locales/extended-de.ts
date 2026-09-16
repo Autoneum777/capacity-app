@@ -664,7 +664,9 @@ export const extendedDe: TranslationTree = {
     machinesImportErrors: 'Fehler',
     bundleTitle: 'Excel-Vorlage — Export / Import gesamte DB',
     bundleIntro:
-      'ZIP mit Capacity-Daten (Excel + scenarios + call-offs). Konten, Rollen und Passwörter werden nie exportiert/importiert — auch wenn eine ältere Excel-Datei noch users/roles-Blätter hat (werden ignoriert). Vollständige Call-offs/Snapshot-Wiederherstellung — über ZIP-Backup. Backup vor Import.',
+      'ZIP mit Capacity-Daten (Excel + scenarios + call-offs). Konten, Rollen und Passwörter werden nie exportiert/importiert — auch wenn eine ältere Excel-Datei noch users/roles-Blätter hat (werden ignoriert). Du kannst unten nur die .xlsx hochladen (nur Tabellendaten) oder das ganze heruntergeladene .zip-Paket — dann werden auch große Szenario-Snapshots und der call-offs-Ordner (Quelldateien) wiederhergestellt. Backup vor Import.',
+    bundleFileLabel: 'Datei .xlsx oder .zip (vollständiges Paket):',
+    bundleFileHint: 'Nur .xlsx importiert nur Tabellendaten. Das vollständige .zip-Paket stellt zusätzlich Szenarien (große Snapshots) und den call-offs-Ordner wieder her.',
     importScope: 'Import-Umfang:',
     importFull: 'Voll (alle Vorlagentabellen — wie bisher)',
     importPartial: 'Teilweise — nur gewählte Tabellen',

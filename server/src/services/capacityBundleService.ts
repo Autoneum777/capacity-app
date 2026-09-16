@@ -3,7 +3,7 @@ import JSZip from 'jszip';
 import { db, saveDb } from '../db/connection.js';
 import { parseInternalMachineNumber } from '../utils/internalMachineNumber.js';
 import { excelExportCell } from '../utils/excelExportCell.js';
-import { addDirectoryToZip, scenarioSnapshotExcelCell } from './backupService.js';
+import { addDirectoryToZip, extractZipFolderToDisk, scenarioSnapshotExcelCell } from './backupService.js';
 import { getCallOffsStorageRoot } from './callOffFileService.js';
 
 const README_SHEET = '_INSTRUKCJA';
@@ -430,6 +430,24 @@ export function clearApplicationDatabase(): ClearDatabaseResult {
  *   Pozostałe tabele w bazie pozostają bez zmian. Wymagane arkusze o nazwach jak tabele.
  */
 export function importCapacityBundleFromBuffer(buf: Buffer, options?: { onlyTables?: string[] | null }): ImportBundleResult {
+  let wb: XLSX.WorkBook;
+  try {
+    wb = XLSX.read(buf, { type: 'buffer', cellDates: true } as XLSX.ParsingOptions);
+  } catch (e: any) {
+    return { ok: false, error: e?.message || 'Niepoprawny plik Excel.' };
+  }
+  return importCapacityBundleFromWorkbook(wb, options);
+}
+
+/**
+ * Rdzeń importu działający na już wczytanym `XLSX.WorkBook` — wydzielony, żeby
+ * `importCapacityBundlePackageFromZipBuffer` mógł najpierw podmienić w arkuszu „scenarios”
+ * komórki z markerem `__FILE__:...` na realną treść z plików scenarios/*.json w paczce ZIP.
+ */
+export function importCapacityBundleFromWorkbook(
+  wb: XLSX.WorkBook,
+  options?: { onlyTables?: string[] | null }
+): ImportBundleResult {
   const order = resolveImportOrder();
   const requested = (options?.onlyTables ?? [])
     .map((t) => String(t).trim())
@@ -465,12 +483,6 @@ export function importCapacityBundleFromBuffer(buf: Buffer, options?: { onlyTabl
   toProcess = withoutAuthTables(toProcess);
 
   const counts: Record<string, number> = {};
-  let wb: XLSX.WorkBook;
-  try {
-    wb = XLSX.read(buf, { type: 'buffer', cellDates: true } as XLSX.ParsingOptions);
-  } catch (e: any) {
-    return { ok: false, error: e?.message || 'Niepoprawny plik Excel.' };
-  }
 
   for (const table of toProcess) {
     if (table !== 'machines') continue;
@@ -560,4 +572,140 @@ export function importCapacityBundleFromBuffer(buf: Buffer, options?: { onlyTabl
     }
     return { ok: false, error: e?.message || 'Błąd importu' };
   }
+}
+
+/** Prefiks komórki Excela — pełna treść snapshotu jest w pliku ZIP (patrz `scenarioSnapshotExcelCell`). */
+const FILE_MARKER_PREFIX = '__FILE__:';
+
+/**
+ * Rozpoznaje paczkę ZIP (Excel + scenarios/ + call-offs/) i odróżnia ją od samego .xlsx —
+ * .xlsx też jest ZIP-em, ale zawiera `[Content_Types].xml`. Bez tego wgranie paczki na trasę
+ * dla .xlsx kończyło się błędem SheetJS „Unsupported ZIP file”.
+ */
+export async function isCapacityBundlePackage(buf: Buffer): Promise<boolean> {
+  if (buf.length < 4 || buf[0] !== 0x50 || buf[1] !== 0x4b) return false;
+  try {
+    const zip = await JSZip.loadAsync(buf);
+    if (zip.file('[Content_Types].xml')) return false;
+    return Object.keys(zip.files).some((k) => !zip.files[k]!.dir && k.toLowerCase().endsWith('.xlsx'));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Podmienia w arkuszu „scenarios” komórki `snapshot` z markerem `__FILE__:scenarios/scenario_{id}.json`
+ * na realną treść z odpowiadającego pliku w paczce ZIP — inaczej import z samego Excela zapisałby
+ * do bazy dosłowny tekst markera i zepsuł scenariusz (duże snapshoty nie mieszczą się w komórce Excela).
+ */
+async function patchScenarioSnapshotFileMarkers(wb: XLSX.WorkBook, zip: JSZip): Promise<number> {
+  const sheetName = 'scenarios';
+  if (!wb.SheetNames.includes(sheetName)) return 0;
+  const ws = wb.Sheets[sheetName];
+  const ref = ws['!ref'];
+  if (!ref) return 0;
+  const range = XLSX.utils.decode_range(ref);
+
+  let snapshotCol = -1;
+  for (let c = range.s.c; c <= range.e.c; c++) {
+    const headerCell = ws[XLSX.utils.encode_cell({ r: range.s.r, c })];
+    if (headerCell && String(headerCell.v ?? '').trim().toLowerCase() === 'snapshot') {
+      snapshotCol = c;
+      break;
+    }
+  }
+  if (snapshotCol < 0) return 0;
+
+  let patched = 0;
+  for (let r = range.s.r + 1; r <= range.e.r; r++) {
+    const addr = XLSX.utils.encode_cell({ r, c: snapshotCol });
+    const cell = ws[addr];
+    const raw = cell?.v;
+    if (typeof raw !== 'string' || !raw.startsWith(FILE_MARKER_PREFIX)) continue;
+    const zipPath = raw.slice(FILE_MARKER_PREFIX.length).trim().replace(/\\/g, '/');
+    const entry = zip.file(zipPath) ?? zip.file(zipPath.replace(/^\/+/, ''));
+    if (!entry) continue;
+    try {
+      const text = await entry.async('string');
+      const parsed = JSON.parse(text) as Record<string, unknown>;
+      const snap = parsed.snapshot;
+      const snapStr = typeof snap === 'string' ? snap : JSON.stringify(snap ?? null);
+      ws[addr] = { t: 's', v: snapStr };
+      patched++;
+    } catch {
+      /* zostaw marker — wiersz zaimportuje się z niepoprawnym snapshotem, ale resztę pliku importujemy dalej */
+    }
+  }
+  return patched;
+}
+
+export type ImportBundlePackageResult =
+  | (Extract<ImportBundleResult, { ok: true }> & { call_offs_restored: number; scenario_snapshots_restored: number })
+  | { ok: false; error: string };
+
+/**
+ * Import z pełnej paczki ZIP pobranej z `/capacity-bundle-template.xlsx` (Excel + scenarios/*.json + call-offs/).
+ * W przeciwieństwie do `importCapacityBundleFromBuffer` (tylko .xlsx) odtwarza też duże snapshoty scenariuszy
+ * (które w samym Excelu są tylko markerem `__FILE__:...`) oraz katalog call-offs/ (pliki źródłowe SalesFcst).
+ */
+export async function importCapacityBundlePackageFromZipBuffer(
+  zipBuf: Buffer,
+  options?: { onlyTables?: string[] | null }
+): Promise<ImportBundlePackageResult> {
+  let zip: JSZip;
+  try {
+    zip = await JSZip.loadAsync(zipBuf);
+  } catch (e: any) {
+    return { ok: false, error: e?.message || 'Niepoprawne archiwum ZIP.' };
+  }
+
+  let excelName: string | null = null;
+  const manifestEntry = zip.file('MANIFEST.json');
+  if (manifestEntry) {
+    try {
+      const manifest = JSON.parse(await manifestEntry.async('string')) as { excel?: string };
+      if (manifest.excel && zip.file(manifest.excel)) excelName = manifest.excel;
+    } catch {
+      /* ignore — spróbuj wykryć plik po rozszerzeniu */
+    }
+  }
+  if (!excelName) {
+    excelName =
+      Object.keys(zip.files).find((k) => !zip.files[k]!.dir && !k.includes('/') && k.toLowerCase().endsWith('.xlsx')) ?? null;
+  }
+  if (!excelName) {
+    return { ok: false, error: 'W archiwum ZIP nie znaleziono pliku .xlsx (np. capacity_baza_szablon.xlsx).' };
+  }
+
+  const excelEntry = zip.file(excelName);
+  if (!excelEntry) {
+    return { ok: false, error: `Brak pliku „${excelName}” w archiwum ZIP.` };
+  }
+  const excelBuf = await excelEntry.async('nodebuffer');
+
+  let wb: XLSX.WorkBook;
+  try {
+    wb = XLSX.read(excelBuf, { type: 'buffer', cellDates: true } as XLSX.ParsingOptions);
+  } catch (e: any) {
+    return { ok: false, error: e?.message || 'Niepoprawny plik Excel w archiwum ZIP.' };
+  }
+
+  const scenarioSnapshotsRestored = await patchScenarioSnapshotFileMarkers(wb, zip);
+
+  const result = importCapacityBundleFromWorkbook(wb, options);
+  if (!result.ok) return result;
+
+  const onlyTables = options?.onlyTables ?? null;
+  const includeCallOffs =
+    !onlyTables?.length || onlyTables.some((t) => t === 'call_off_comparisons' || t === 'call_off_volumes');
+  let callOffsRestored = 0;
+  if (includeCallOffs) {
+    try {
+      callOffsRestored = await extractZipFolderToDisk(zip, 'call-offs', getCallOffsStorageRoot());
+    } catch {
+      callOffsRestored = 0;
+    }
+  }
+
+  return { ...result, call_offs_restored: callOffsRestored, scenario_snapshots_restored: scenarioSnapshotsRestored };
 }

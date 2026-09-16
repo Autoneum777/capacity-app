@@ -576,9 +576,13 @@ export default function AdminSettings() {
 
   const importBundle = () => {
     if (!bundleFile) {
-      setError('Wybierz plik .xlsx do wgrania.');
+      setError('Wybierz plik .xlsx lub .zip (pełna paczka) do wgrania.');
       return;
     }
+    const isZip =
+      bundleFile.name.toLowerCase().endsWith('.zip') ||
+      bundleFile.type === 'application/zip' ||
+      bundleFile.type === 'application/x-zip-compressed';
     const phrase = bundleConfirm.trim();
     if (phrase !== 'IMPORTUJ_BAZE') {
       setError('Aby zaimportować, wpisz dokładnie: IMPORTUJ_BAZE (wielkość liter ma znaczenie).');
@@ -590,18 +594,23 @@ export default function AdminSettings() {
       setError('Zaznacz co najmniej jedną tabelę do importu częściowego.');
       return;
     }
+    const zipNote = isZip
+      ? ' Z paczki .zip zostaną też odtworzone duże snapshoty scenariuszy oraz katalog call-offs (pliki źródłowe).'
+      : '';
     const confirmMsg =
       bundleImportMode === 'partial'
-        ? `Import częściowy: wyczyszczone i uzupełnione z pliku zostaną wyłącznie tabele: ${onlyTables.join(', ')}. Pozostałe dane w bazie nie są usuwane. W pliku muszą być arkusze o nazwach jak tabele. Wykonać backup przed kontynuacją. Kontynuować?`
-        : 'Import z Excela usunie dane w większości tabel i wstawi zawartość pliku. Ustawienia backupu pozostaną. Zalecany jest świeży backup. Kontynuować?';
+        ? `Import częściowy: wyczyszczone i uzupełnione z pliku zostaną wyłącznie tabele: ${onlyTables.join(', ')}. Pozostałe dane w bazie nie są usuwane. W pliku muszą być arkusze o nazwach jak tabele.${zipNote} Wykonać backup przed kontynuacją. Kontynuować?`
+        : `Import z Excela usunie dane w większości tabel i wstawi zawartość pliku. Ustawienia backupu pozostaną.${zipNote} Zalecany jest świeży backup. Kontynuować?`;
     if (!window.confirm(confirmMsg)) {
       return;
     }
     setBundleImporting(true);
     setError('');
     setMessage('');
-    api.admin
-      .importCapacityBundle(bundleFile, phrase, bundleImportMode === 'partial' ? onlyTables : undefined)
+    const importCall = isZip
+      ? api.admin.importCapacityBundleZip(bundleFile, phrase, bundleImportMode === 'partial' ? onlyTables : undefined)
+      : api.admin.importCapacityBundle(bundleFile, phrase, bundleImportMode === 'partial' ? onlyTables : undefined);
+    importCall
       .then((r) => {
         const parts = Object.entries(r.rows_counts)
           .filter(([, n]) => n > 0)
@@ -609,7 +618,12 @@ export default function AdminSettings() {
           .slice(0, 12);
         const more = Object.values(r.rows_counts).filter((n) => n > 0).length > 12 ? '…' : '';
         const prefix = r.partial ? 'Import częściowy zakończony. ' : 'Import zakończony. ';
-        setMessage(`${prefix}Wstawione wiersze (fragment): ${parts.join(', ')}${more}`);
+        const zipResult = r as Partial<{ call_offs_restored: number; scenario_snapshots_restored: number }>;
+        const extra =
+          zipResult.call_offs_restored != null
+            ? ` Odtworzono katalog call-offs (${zipResult.call_offs_restored} plików) i ${zipResult.scenario_snapshots_restored ?? 0} snapshotów scenariuszy z paczki ZIP.`
+            : '';
+        setMessage(`${prefix}Wstawione wiersze (fragment): ${parts.join(', ')}${more}${extra}`);
         setBundleFile(null);
         setBundleConfirm('');
       })
@@ -937,13 +951,16 @@ export default function AdminSettings() {
           </div>
         )}
         <label style={{ display: 'block', marginBottom: 10 }}>
-          {t('adminSettingsExtra.xlsxFile')}
+          {t('adminSettingsExtra.bundleFileLabel')}
           <input
             type="file"
-            accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            accept=".xlsx,.zip,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/zip,application/x-zip-compressed"
             style={{ display: 'block', marginTop: 6 }}
             onChange={(e) => setBundleFile(e.target.files?.[0] ?? null)}
           />
+          <span style={{ display: 'block', marginTop: 4, fontSize: 12, color: '#777' }}>
+            {t('adminSettingsExtra.bundleFileHint')}
+          </span>
         </label>
         <label style={{ display: 'block', marginBottom: 10 }}>
           {t('adminSettingsExtra.importConfirmLabel')}

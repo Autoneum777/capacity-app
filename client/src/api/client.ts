@@ -521,6 +521,33 @@ export const api = {
       if (!res.ok) throw friendlyHttpError(res, (data as { error?: string }).error);
       return data as { ok: boolean; tables_imported: string[]; rows_counts: Record<string, number>; partial: boolean };
     },
+    /**
+     * Import z pełnej paczki .zip (jak pobrana z downloadCapacityBundleTemplate): Excel + scenarios/*.json + call-offs/.
+     * W przeciwieństwie do importCapacityBundle (tylko .xlsx) odtwarza też duże snapshoty scenariuszy
+     * (marker __FILE__ w komórce Excela) i katalog plików źródłowych call-offs.
+     */
+    importCapacityBundleZip: async (file: File, confirm: string, onlyTables?: string[]) => {
+      const fd = new FormData();
+      fd.append('confirm', confirm);
+      if (onlyTables?.length) fd.append('onlyTables', JSON.stringify(onlyTables));
+      fd.append('file', file);
+      let res: Response;
+      try {
+        res = await fetch(`${BASE}/admin/capacity-bundle-import-zip`, { method: 'POST', body: fd });
+      } catch (e) {
+        throw mapFetchFailure(e);
+      }
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw friendlyHttpError(res, (data as { error?: string }).error);
+      return data as {
+        ok: boolean;
+        tables_imported: string[];
+        rows_counts: Record<string, number>;
+        partial: boolean;
+        call_offs_restored: number;
+        scenario_snapshots_restored: number;
+      };
+    },
     /** Diagnostyka: czy backend ma endpoint szablonu v2 (`operacje-v2`). */
     fetchCapacityDataImportSchemaDiagnostics: async (): Promise<
       | { ok: true; schemaTag: string; templateFilename: string }

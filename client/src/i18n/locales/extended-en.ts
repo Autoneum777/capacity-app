@@ -664,7 +664,9 @@ export const extendedEn: TranslationTree = {
     machinesImportErrors: 'errors',
     bundleTitle: 'Excel template — export / import entire database',
     bundleIntro:
-      'Download a ZIP with Capacity data (Excel + scenarios + call-offs). Accounts, roles and passwords are never exported or imported — even if an older Excel file still has users/roles sheets (they are ignored). Full Call offs/snapshot recovery — via ZIP backup. Backup before import.',
+      'Download a ZIP with Capacity data (Excel + scenarios + call-offs). Accounts, roles and passwords are never exported or imported — even if an older Excel file still has users/roles sheets (they are ignored). You can upload just the .xlsx below (table data only) or the whole downloaded .zip package — that also restores large scenario snapshots and the call-offs folder (source files). Backup before import.',
+    bundleFileLabel: 'File .xlsx or .zip (full package):',
+    bundleFileHint: 'The .xlsx alone imports only table data. The full .zip package also restores scenarios (large snapshots) and the call-offs folder.',
     importScope: 'Import scope:',
     importFull: 'Full (all template tables — as before)',
     importPartial: 'Partial — selected tables only',

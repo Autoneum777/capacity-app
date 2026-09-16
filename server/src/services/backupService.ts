@@ -87,7 +87,7 @@ function clearDirectoryContents(dir: string): void {
   }
 }
 
-async function extractZipFolderToDisk(
+export async function extractZipFolderToDisk(
   zip: JSZip,
   zipFolderPrefix: string,
   targetDir: string

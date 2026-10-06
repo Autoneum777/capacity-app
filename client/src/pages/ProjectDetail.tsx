@@ -478,6 +478,10 @@ function ProjectOperationsTab({
   const { t } = useI18n();
   const { referenceDisplay, machineDisplay } = useReferenceDisplay();
   const [opSearch, setOpSearch] = useState('');
+  const [heirPick, setHeirPick] = useState<{
+    opId: number;
+    candidates: { operationId: number; machineId: number; machineLabel: string }[];
+  } | null>(null);
   const formatMachineLabel = (op: any): string =>
     formatMachineSapInternalLabel(
       { sap_number: op?.machine_sap_number, internal_number: op?.machine_number },
@@ -625,6 +629,26 @@ function ProjectOperationsTab({
   /** Wiersz rodzica zaczyna tekst po chevronie (~36px); dzieci mają wyraźnie większe wcięcie niż ta linia bazowa. */
   const childFirstColPaddingLeft = 'calc(0.75rem + 2.75rem + 1.25rem)';
 
+  const removeOperation = (opId: number, heirOperationId?: number) => {
+    api.projects
+      .deleteOperation(project.id, opId, heirOperationId)
+      .then((result) => {
+        if (result?.message) window.alert(result.message);
+        onReload();
+      })
+      .catch((e: Error & { code?: string; candidates?: { operationId: number; machineId: number; machineLabel: string }[] }) => {
+        if (e?.code === 'choose_heir' && e.candidates?.length) {
+          const unique = new Map<number, { operationId: number; machineId: number; machineLabel: string }>();
+          for (const candidate of e.candidates) {
+            if (!unique.has(candidate.machineId)) unique.set(candidate.machineId, candidate);
+          }
+          setHeirPick({ opId, candidates: [...unique.values()] });
+          return;
+        }
+        window.alert(e?.message || 'Nie udało się usunąć operacji.');
+      });
+  };
+
   const renderRow = (op: any, opts: { isChild: boolean }) => {
     const { isChild } = opts;
     const allocationYears = allocationYearsLabel(op);
@@ -662,7 +686,7 @@ function ProjectOperationsTab({
             type="button"
             onClick={() => {
               if (!confirmDelete(t('projectDetailExtra.deleteOpConfirm'))) return;
-              api.projects.deleteOperation(project.id, op.id).then(onReload);
+              removeOperation(op.id);
             }}
             style={{ padding: '0.25rem 0.5rem', background: '#c62828', color: 'white', border: 'none', borderRadius: 4 }}
           >
@@ -777,7 +801,7 @@ function ProjectOperationsTab({
                       type="button"
                       onClick={() => {
                         if (!confirmDelete(t('projectDetailExtra.deleteOpConfirm'))) return;
-                        api.projects.deleteOperation(project.id, root.id).then(onReload);
+                        removeOperation(root.id);
                       }}
                       style={{ padding: '0.25rem 0.5rem', background: '#c62828', color: 'white', border: 'none', borderRadius: 4 }}
                     >
@@ -794,6 +818,61 @@ function ProjectOperationsTab({
       <button type="button" onClick={onNew} style={{ marginTop: 8, padding: '0.5rem 1rem', background: '#2196f3', color: 'white', border: 'none', borderRadius: 4 }}>
         {t('projectDetailExtra.newOperation')}
       </button>
+      {heirPick && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0,0,0,0.35)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 40,
+            padding: 16,
+          }}
+        >
+          <div style={{ background: 'white', borderRadius: 8, padding: '1.25rem', width: 'min(420px, 100%)', boxShadow: '0 8px 24px rgba(0,0,0,0.2)' }}>
+            <h3 style={{ margin: '0 0 0.5rem' }}>Wybierz maszynę docelową</h3>
+            <p style={{ margin: '0 0 1rem', color: '#444', fontSize: 14 }}>
+              Wolumen nie może wrócić na nieaktywną ani usuwaną maszynę. Wybierz aktywną maszynę, która ma go przejąć.
+            </p>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {heirPick.candidates.map((candidate) => (
+                <button
+                  key={candidate.machineId}
+                  type="button"
+                  onClick={() => {
+                    const opId = heirPick.opId;
+                    const heirOperationId = candidate.operationId;
+                    setHeirPick(null);
+                    removeOperation(opId, heirOperationId);
+                  }}
+                  style={{
+                    textAlign: 'left',
+                    padding: '0.65rem 0.8rem',
+                    border: '1px solid #c5e1a5',
+                    borderRadius: 6,
+                    background: '#f1f8e9',
+                    cursor: 'pointer',
+                    fontWeight: 600,
+                  }}
+                >
+                  {candidate.machineLabel}
+                </button>
+              ))}
+            </div>
+            <button
+              type="button"
+              onClick={() => setHeirPick(null)}
+              style={{ marginTop: 14, padding: '0.45rem 0.8rem', border: '1px solid #bdbdbd', borderRadius: 4, background: 'white', cursor: 'pointer' }}
+            >
+              {t('common.cancel')}
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

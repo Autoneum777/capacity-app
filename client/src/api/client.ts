@@ -1063,7 +1063,31 @@ export const api = {
     phases: (projectId: number) => request<any[]>(`/projects/${projectId}/phases`),
     addOperation: (projectId: number, body: any) => request<any>(`/projects/${projectId}/operations`, { method: 'POST', body: JSON.stringify(body) }),
     updateOperation: (projectId: number, opId: number, body: any) => request<any>(`/projects/${projectId}/operations/${opId}`, { method: 'PUT', body: JSON.stringify(body) }),
-    deleteOperation: (projectId: number, opId: number) => request<void>(`/projects/${projectId}/operations/${opId}`, { method: 'DELETE' }),
+    deleteOperation: async (projectId: number, opId: number, heirOperationId?: number) => {
+      const q = heirOperationId != null ? `?heirOperationId=${heirOperationId}` : '';
+      let res: Response;
+      try {
+        res = await fetch(`${BASE}/projects/${projectId}/operations/${opId}${q}`, { method: 'DELETE', credentials: 'include' });
+      } catch (e) {
+        throw mapFetchFailure(e);
+      }
+      const data = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        message?: string | null;
+        code?: string;
+        candidates?: { operationId: number; machineId: number; machineLabel: string }[];
+      };
+      if (!res.ok) {
+        const err = new Error(data.error || res.statusText || `HTTP ${res.status}`) as Error & {
+          code?: string;
+          candidates?: { operationId: number; machineId: number; machineLabel: string }[];
+        };
+        err.code = data.code;
+        err.candidates = data.candidates;
+        throw err;
+      }
+      return data;
+    },
     getOperationVolumes: (projectId: number, opId: number) => request<{ year: number; volume_value: number; volume_unit: string }[]>(`/projects/${projectId}/operations/${opId}/volumes`),
     setOperationVolumeYear: (projectId: number, opId: number, body: { year: number; volume_value: number; volume_unit: string }) => request<any>(`/projects/${projectId}/operations/${opId}/volumes`, { method: 'PUT', body: JSON.stringify(body) }),
     setOperationVolumes: (projectId: number, opId: number, volumes: { year: number; volume_value: number; volume_unit: string }[]) => request<any[]>(`/projects/${projectId}/operations/${opId}/volumes`, { method: 'PUT', body: JSON.stringify({ volumes }) }),

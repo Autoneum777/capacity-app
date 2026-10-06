@@ -6,10 +6,56 @@ import {
   findAllocationTreeRootOperationId,
   mergeSplitChildVolumesIntoParent,
   mergeSplitChildYearVolumeIntoParent,
+  resolveVolumeHeir,
+  type VolumeHeirCandidate,
 } from './allocationService.js';
 import { invalidateAllocationSplitIndex } from './capacityService.js';
 
-export type DeleteOperationResult = { ok: true } | { ok: false; error: string; statusCode?: number };
+export type DeleteOperationResult =
+  | { ok: true; message?: string }
+  | { ok: false; error: string; statusCode?: number; code?: 'choose_heir' | 'no_heir'; candidates?: VolumeHeirCandidate[] };
+
+function operationHasPositiveVolume(operationId: number, year?: number): boolean {
+  const rows = (
+    year != null
+      ? db
+          .prepare(
+            `SELECT volume_value, volume_value_before FROM operation_volume_by_year WHERE operation_id = ? AND year = ?`
+          )
+          .all(operationId, year)
+      : db.prepare(`SELECT volume_value, volume_value_before FROM operation_volume_by_year WHERE operation_id = ?`).all(operationId)
+  ) as { volume_value: number; volume_value_before: number | null }[];
+  return rows.some(
+    (row) => Number(row.volume_value) > 1e-6 || (row.volume_value_before != null && Number(row.volume_value_before) > 1e-6)
+  );
+}
+
+function writeInheritanceNote(
+  projectId: number,
+  note: string,
+  machineId: number | null,
+  partId: number | null,
+  operationId: number
+): void {
+  const noteDate = new Date().toISOString().slice(0, 10);
+  try {
+    db.prepare(
+      `INSERT INTO project_notes (project_id, note_date, author, note, note_type, machine_id, part_id, operation_id)
+       VALUES (?, ?, 'system', ?, 'auto', ?, ?, ?)`
+    ).run(projectId, noteDate, note, machineId, partId, operationId);
+  } catch {
+    try {
+      db.prepare(`INSERT INTO project_notes (project_id, note_date, author, note, note_type) VALUES (?, ?, 'system', ?, 'auto')`).run(
+        projectId,
+        noteDate,
+        note
+      );
+    } catch {
+      /* notatka jest dodatkiem — brak tabeli nie może cofnąć scalenia wolumenu */
+    }
+  }
+}
+
 
 /** Usuwa z projektu detale bez powiązanych operacji (główny part_id ani set_member). */
 export function cleanupOrphanPartsForProject(projectId: number): void {
@@ -28,7 +74,11 @@ export function cleanupOrphanPartsForProject(projectId: number): void {
 }
 
 /** Usuwa operację w projekcie (ta sama logika co DELETE /projects/:id/operations/:opId). */
-export function deleteOperationInProject(projectId: number, opId: number): DeleteOperationResult {
+export function deleteOperationInProject(
+  projectId: number,
+  opId: number,
+  preferredHeirOperationId?: number | null
+): DeleteOperationResult {
   const opRow = db
     .prepare('SELECT id, split_from_operation_id, machine_id, part_id FROM operations WHERE id = ? AND project_id = ?')
     .get(opId, projectId) as
@@ -53,7 +103,28 @@ export function deleteOperationInProject(projectId: number, opId: number): Delet
       return { ok: false, statusCode: 400, error: 'Nie można ustalić operacji źródłowej do scalenia wolumenu.' };
     }
     const childIds = db.prepare('SELECT id FROM operations WHERE split_from_operation_id = ?').all(opId) as { id: number }[];
-    mergeSplitChildVolumesIntoParent(rootId, opId);
+    const mustInherit = operationHasPositiveVolume(opId);
+    const heir = mustInherit ? resolveVolumeHeir(opId, preferredHeirOperationId) : null;
+    if (heir && !heir.ok) {
+      return {
+        ok: false,
+        error: heir.error,
+        statusCode: heir.code === 'choose_heir' ? 409 : 400,
+        code: heir.code,
+        candidates: heir.candidates,
+      };
+    }
+    if (heir?.ok && heir.heirOperationId !== opId) mergeSplitChildVolumesIntoParent(heir.heirOperationId, opId);
+    else if (!mustInherit) mergeSplitChildVolumesIntoParent(rootId, opId);
+    if (heir?.ok && heir.skippedInactive) {
+      writeInheritanceNote(
+        projectId,
+        `Odziedziczenie: wolumen operacji #${opId} przeszedł na maszynę ${heir.machineLabel}, bo maszyna matki jest nieaktywna.`,
+        opRow.machine_id,
+        opRow.part_id,
+        heir.heirOperationId
+      );
+    }
     db.prepare('UPDATE operations SET split_from_operation_id = ? WHERE split_from_operation_id = ?').run(rootId, opId);
     for (const { id } of childIds) {
       ensureSplitChildYearCoverage(id);
@@ -70,13 +141,40 @@ export function deleteOperationInProject(projectId: number, opId: number): Delet
     }
     cleanupOrphanOperationYearVolumes();
     invalidateAllocationSplitIndex();
-    return { ok: true };
+    return heir?.ok && heir.skippedInactive
+      ? { ok: true, message: `Wolumen przeszedł na maszynę ${heir.machineLabel}, bo maszyna matki jest nieaktywna.` }
+      : { ok: true };
   }
 
   const parentId = opRow.split_from_operation_id != null ? Number(opRow.split_from_operation_id) : null;
+  let inheritedMessage: string | undefined;
   if (parentId != null && !Number.isNaN(parentId)) {
     const parent = db.prepare('SELECT id FROM operations WHERE id = ? AND project_id = ?').get(parentId, projectId);
-    if (parent) mergeSplitChildVolumesIntoParent(parentId, opId);
+    if (parent) {
+      const mustInherit = operationHasPositiveVolume(opId);
+      const heir = mustInherit ? resolveVolumeHeir(opId, preferredHeirOperationId) : null;
+      if (heir && !heir.ok) {
+        return {
+          ok: false,
+          error: heir.error,
+          statusCode: heir.code === 'choose_heir' ? 409 : 400,
+          code: heir.code,
+          candidates: heir.candidates,
+        };
+      }
+      if (heir?.ok && heir.heirOperationId !== opId) mergeSplitChildVolumesIntoParent(heir.heirOperationId, opId);
+      else if (!mustInherit) mergeSplitChildVolumesIntoParent(parentId, opId);
+      if (heir?.ok && heir.skippedInactive) {
+        inheritedMessage = `Wolumen przeszedł na maszynę ${heir.machineLabel}, bo maszyna matki jest nieaktywna.`;
+        writeInheritanceNote(
+          projectId,
+          `Odziedziczenie: wolumen operacji #${opId} przeszedł na maszynę ${heir.machineLabel}, bo maszyna matki jest nieaktywna.`,
+          opRow.machine_id,
+          opRow.part_id,
+          heir.heirOperationId
+        );
+      }
+    }
   }
 
   const r = db.prepare('DELETE FROM operations WHERE id = ? AND project_id = ?').run(opId, projectId);
@@ -88,7 +186,7 @@ export function deleteOperationInProject(projectId: number, opId: number): Delet
   }
   cleanupOrphanOperationYearVolumes();
   invalidateAllocationSplitIndex();
-  return { ok: true };
+  return inheritedMessage ? { ok: true, message: inheritedMessage } : { ok: true };
 }
 
 /**
@@ -98,7 +196,8 @@ export function deleteOperationInProject(projectId: number, opId: number): Delet
 export function deleteOperationYearVolumeInProject(
   projectId: number,
   opId: number,
-  year: number
+  year: number,
+  preferredHeirOperationId?: number | null
 ): DeleteOperationResult {
   const op = db
     .prepare('SELECT id, split_from_operation_id FROM operations WHERE id = ? AND project_id = ?')
@@ -107,10 +206,30 @@ export function deleteOperationYearVolumeInProject(
   if (!Number.isInteger(year)) return { ok: false, error: 'Nieprawidłowy rok', statusCode: 400 };
 
   const parentId = op.split_from_operation_id != null ? Number(op.split_from_operation_id) : null;
+  let inheritedMessage: string | undefined;
   if (parentId != null && Number.isFinite(parentId)) {
     const parent = db.prepare('SELECT id FROM operations WHERE id = ? AND project_id = ?').get(parentId, projectId);
     if (parent) {
-      mergeSplitChildYearVolumeIntoParent(parentId, opId, year);
+      const mustInherit = operationHasPositiveVolume(opId, year);
+      const heir = mustInherit ? resolveVolumeHeir(opId, preferredHeirOperationId) : null;
+      if (heir && !heir.ok) {
+        return {
+          ok: false,
+          error: heir.error,
+          statusCode: heir.code === 'choose_heir' ? 409 : 400,
+          code: heir.code,
+          candidates: heir.candidates,
+        };
+      }
+      if (heir?.ok && heir.heirOperationId !== opId) mergeSplitChildYearVolumeIntoParent(heir.heirOperationId, opId, year);
+      else if (!mustInherit) mergeSplitChildYearVolumeIntoParent(parentId, opId, year);
+      if (heir?.ok && heir.skippedInactive) {
+        inheritedMessage = `Wolumen roku ${year} przeszedł na maszynę ${heir.machineLabel}, bo maszyna matki jest nieaktywna.`;
+        const ctx = db
+          .prepare('SELECT machine_id, part_id FROM operations WHERE id = ?')
+          .get(opId) as { machine_id: number | null; part_id: number | null } | undefined;
+        writeInheritanceNote(projectId, `Odziedziczenie: ${inheritedMessage}`, ctx?.machine_id ?? null, ctx?.part_id ?? null, heir.heirOperationId);
+      }
     }
   }
 
@@ -126,7 +245,7 @@ export function deleteOperationYearVolumeInProject(
   }
 
   invalidateAllocationSplitIndex();
-  return { ok: true };
+  return inheritedMessage ? { ok: true, message: inheritedMessage } : { ok: true };
 }
 
 export type DesignationRelatedOperation = {

@@ -13,7 +13,7 @@ import {
   operationHasAlternativeCycle,
   invalidateAllocationSplitIndex,
 } from './capacityService.js';
-import { getProductionMonthsInYear } from '../utils/sopEopFormat.js';
+import { assignIsoWeekToStartMonth, getProductionMonthNumbersInYear, getProductionMonthsInYear, parseSopEop } from '../utils/sopEopFormat.js';
 
 /** Alokacja „placeholder” — wolumen 0, ale rok w zakresie SOP–EOP (wolumeny mogą pojawić się później). */
 export function canAllocateZeroVolumePlaceholder(
@@ -467,6 +467,8 @@ export function executeAllocation(
     )
     .get(operationId) as any;
   if (!op) return { success: false, error: 'Operation not found' };
+  const targetMachineError = allocationTargetMachineError(targetMachineId);
+  if (targetMachineError) return { success: false, error: targetMachineError };
 
   const settings = resolveSettingsForYear(year);
 
@@ -748,6 +750,8 @@ export function executeAllocationInScenario(
   const ops = bundle.operations || [];
   const op = ops.find((o: any) => Number(o.id) === operationId) as any;
   if (!op) return { success: false, error: 'Operation not found' };
+  const targetMachineError = allocationTargetMachineError(targetMachineId);
+  if (targetMachineError) return { success: false, error: targetMachineError };
 
   const proj = (bundle.projects || []).find((p: any) => Number(p.id) === Number(op.project_id));
   const sop = proj?.sop ?? '';
@@ -924,6 +928,391 @@ export function findAllocationTreeRootOperationId(operationId: number): number {
     id = row.split_from_operation_id;
   }
   return operationId;
+}
+
+const VOLUME_EPS = 1e-6;
+
+type OpMachineRow = {
+  id: number;
+  split_from_operation_id: number | null;
+  machine_id: number | null;
+  part_id: number | null;
+  project_id: number | null;
+  status: string | null;
+  internal_number: string | number | null;
+  machine_row_id: number | null;
+};
+
+export type VolumeHeirCandidate = {
+  operationId: number;
+  machineId: number;
+  machineLabel: string;
+};
+
+export type VolumeHeirResolution =
+  | { ok: true; heirOperationId: number; machineLabel: string; skippedInactive: boolean }
+  | { ok: false; code: 'choose_heir' | 'no_heir'; error: string; candidates: VolumeHeirCandidate[] };
+
+function machineStatusCanHoldVolume(status: unknown, machineRowId: number | null): boolean {
+  if (machineRowId == null) return false;
+  return String(status ?? '').trim().toLowerCase() !== 'inactive';
+}
+
+function machineLabelOf(row: { internal_number: string | number | null; machine_id: number | null }): string {
+  if (row.internal_number != null && String(row.internal_number).trim() !== '') return String(row.internal_number);
+  return row.machine_id != null ? `#${row.machine_id}` : '?';
+}
+
+function loadOpMachine(operationId: number): OpMachineRow | undefined {
+  return db
+    .prepare(
+      `SELECT o.id, o.split_from_operation_id, o.machine_id, o.part_id, o.project_id,
+              m.status, m.internal_number, m.id AS machine_row_id
+       FROM operations o
+       LEFT JOIN machines m ON m.id = o.machine_id
+       WHERE o.id = ?`
+    )
+    .get(operationId) as OpMachineRow | undefined;
+}
+
+function allocationTargetMachineError(targetMachineId: number): string | null {
+  const row = db
+    .prepare('SELECT id, status, internal_number FROM machines WHERE id = ?')
+    .get(targetMachineId) as { id: number; status: string | null; internal_number: string | number | null } | undefined;
+  if (!row) return 'Nie znaleziono maszyny docelowej.';
+  if (!machineStatusCanHoldVolume(row.status, row.id)) {
+    return `Maszyna ${machineLabelOf({ internal_number: row.internal_number, machine_id: row.id })} jest nieaktywna. Wolumen można przenieść tylko na maszynę aktywną lub RFQ.`;
+  }
+  return null;
+}
+
+function collectAllocationTree(rootId: number): OpMachineRow[] {
+  const out: OpMachineRow[] = [];
+  const queue = [rootId];
+  const seen = new Set<number>();
+  while (queue.length) {
+    const id = queue.shift()!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const row = loadOpMachine(id);
+    if (!row) continue;
+    out.push(row);
+    const kids = db.prepare('SELECT id FROM operations WHERE split_from_operation_id = ?').all(id) as { id: number }[];
+    for (const kid of kids) queue.push(Number(kid.id));
+  }
+  return out;
+}
+
+/**
+ * Spadkobierca wolumenu usuwanego z dziecka alokacji.
+ * Najbliższy przodek na maszynie active/RFQ; jeśli cała linia matek jest nieaktywna —
+ * jedyna inna operacja tego drzewa i detalu na maszynie, która może przyjąć wolumen.
+ * Przy kilku kandydatach wymagane jest jawne wskazanie.
+ */
+export function resolveVolumeHeir(sourceOperationId: number, preferredHeirOperationId?: number | null): VolumeHeirResolution {
+  const source = loadOpMachine(sourceOperationId);
+  if (!source) return { ok: false, code: 'no_heir', error: 'Nie znaleziono operacji.', candidates: [] };
+  const parentId = source.split_from_operation_id != null ? Number(source.split_from_operation_id) : null;
+  const sourceCanHold = machineStatusCanHoldVolume(source.status, source.machine_row_id);
+  if ((parentId == null || !Number.isFinite(parentId)) && sourceCanHold) {
+    return { ok: true, heirOperationId: source.id, machineLabel: machineLabelOf(source), skippedInactive: false };
+  }
+
+  let nearest: OpMachineRow | undefined;
+  let skippedInactive = false;
+  let currentId: number | null = parentId != null && Number.isFinite(parentId) ? parentId : null;
+  const seenAncestors = new Set<number>();
+  while (currentId != null && !seenAncestors.has(currentId)) {
+    seenAncestors.add(currentId);
+    const row = loadOpMachine(currentId);
+    if (!row) break;
+    if (machineStatusCanHoldVolume(row.status, row.machine_row_id)) {
+      nearest = row;
+      break;
+    }
+    skippedInactive = true;
+    currentId = row.split_from_operation_id != null ? Number(row.split_from_operation_id) : null;
+  }
+
+  if (nearest && source.machine_id != null && Number(nearest.machine_id) === Number(source.machine_id)) {
+    nearest = undefined;
+    skippedInactive = true;
+  }
+
+  const rootId = findAllocationTreeRootOperationId(sourceOperationId);
+  const depthById = new Map<number, number>();
+  const depthOf = (id: number): number => {
+    const cached = depthById.get(id);
+    if (cached != null) return cached;
+    let depth = 0;
+    let current = id;
+    const seen = new Set<number>();
+    while (!seen.has(current)) {
+      seen.add(current);
+      const row = loadOpMachine(current);
+      if (!row || row.split_from_operation_id == null) break;
+      depth++;
+      current = Number(row.split_from_operation_id);
+    }
+    depthById.set(id, depth);
+    return depth;
+  };
+  const byMachine = new Map<number, { candidate: VolumeHeirCandidate; depth: number }>();
+  for (const row of collectAllocationTree(rootId)) {
+    if (row.id === source.id) continue;
+    if (source.machine_id != null && Number(row.machine_id) === Number(source.machine_id)) continue;
+    if (!machineStatusCanHoldVolume(row.status, row.machine_row_id)) continue;
+    if (source.part_id != null && row.part_id != null && Number(row.part_id) !== Number(source.part_id)) continue;
+    const machineId = Number(row.machine_id);
+    if (!Number.isFinite(machineId)) continue;
+    const candidate: VolumeHeirCandidate = {
+      operationId: row.id,
+      machineId,
+      machineLabel: machineLabelOf(row),
+    };
+    const depth = depthOf(row.id);
+    const prev = byMachine.get(machineId);
+    if (!prev || depth < prev.depth) byMachine.set(machineId, { candidate, depth });
+  }
+  const candidates = [...byMachine.values()]
+    .map((entry) => entry.candidate)
+    .sort((a, b) => a.machineLabel.localeCompare(b.machineLabel, 'pl', { numeric: true }));
+
+  const preferred = preferredHeirOperationId != null ? Number(preferredHeirOperationId) : NaN;
+  if (!nearest && candidates.length > 1) {
+    if (Number.isFinite(preferred)) {
+      const picked = candidates.find((c) => c.operationId === preferred);
+      if (picked) {
+        return { ok: true, heirOperationId: picked.operationId, machineLabel: picked.machineLabel, skippedInactive: true };
+      }
+    }
+    return {
+      ok: false,
+      code: 'choose_heir',
+      error: 'Wolumen nie może wrócić na nieaktywną maszynę. Wybierz aktywną maszynę docelową.',
+      candidates,
+    };
+  }
+
+  if (nearest) {
+    return {
+      ok: true,
+      heirOperationId: nearest.id,
+      machineLabel: machineLabelOf(nearest),
+      skippedInactive,
+    };
+  }
+  if (candidates.length === 1) {
+    return {
+      ok: true,
+      heirOperationId: candidates[0].operationId,
+      machineLabel: candidates[0].machineLabel,
+      skippedInactive: true,
+    };
+  }
+  return {
+    ok: false,
+    code: 'no_heir',
+    error:
+      'Wolumen nie może wrócić na nieaktywną maszynę, a w tym drzewie alokacji nie ma aktywnej operacji, która może go przejąć. Wolumen pozostaje bez zmian.',
+    candidates: [],
+  };
+}
+
+type YearVolumePoint = { year: number; month: number; week: number };
+
+function todayVolumePoint(now = new Date()): YearVolumePoint {
+  return assignIsoWeekToStartMonth(now.getFullYear(), now.getMonth() + 1, now.getDate());
+}
+
+function isAfterToday(year: number, month: number, week: number, today: YearVolumePoint): boolean {
+  if (year !== today.year) return year > today.year;
+  if (month !== today.month) return month > today.month;
+  return week > today.week;
+}
+
+/** Czy wiersz roku ma dodatni wolumen od bieżącego tygodnia włącznie (historia sprzed dziś nie liczy się). */
+export function yearRowHasForwardVolume(
+  row: {
+    year: number;
+    volume_value: number;
+    volume_value_before?: number | null;
+    effective_from_month?: number | null;
+    effective_from_week?: number | null;
+  },
+  now = new Date()
+): boolean {
+  const year = Number(row.year);
+  if (!Number.isInteger(year)) return false;
+  const today = todayVolumePoint(now);
+  if (year < today.year) return false;
+  const after = Number(row.volume_value) > VOLUME_EPS;
+  const before = row.volume_value_before != null && Number(row.volume_value_before) > VOLUME_EPS;
+  if (year > today.year) return after || before;
+  if (row.effective_from_month == null) return after;
+  const fromMonth = Math.floor(Number(row.effective_from_month));
+  const fromWeek = Math.floor(Number(row.effective_from_week) || 1);
+  if (isAfterToday(year, fromMonth, fromWeek, today)) return before || after;
+  return after;
+}
+
+/**
+ * Lata produkcji od dziś włącznie (SOP–EOP), tak jak w kalkulatorze.
+ * Brak SOP/EOP = operacja aktywna; horyzont 20 lat.
+ */
+function productionYearsFromToday(sop: unknown, eop: unknown, today: YearVolumePoint): number[] {
+  const sopP = parseSopEop(sop);
+  const eopP = parseSopEop(eop);
+  if (!sopP || !eopP) {
+    const years: number[] = [];
+    for (let y = today.year; y <= today.year + 20; y++) years.push(y);
+    return years;
+  }
+  if (eopP.year < today.year) return [];
+  if (eopP.year === today.year && eopP.month < today.month) return [];
+  const start = Math.max(today.year, sopP.year);
+  const years: number[] = [];
+  for (let y = start; y <= eopP.year; y++) {
+    if (y === today.year) {
+      const months = getProductionMonthNumbersInYear(sop, eop, y);
+      if (!months.some((m) => m >= today.month)) continue;
+    }
+    years.push(y);
+  }
+  return years;
+}
+
+/** Dezaktywacja: wolumen od dziś w przód. Lata historyczne i część bieżącego roku przed dziś nie blokują. */
+export function forwardVolumeBlockForMachine(machineId: number, now = new Date()): { blocked: boolean; years: number[] } {
+  const ops = db
+    .prepare(
+      `SELECT o.id, o.volume_value, o.volume_unit, o.split_from_operation_id, o.project_id, o.part_id, p.sop, p.eop
+       FROM operations o
+       LEFT JOIN projects p ON p.id = o.project_id
+       WHERE o.machine_id = ?`
+    )
+    .all(machineId) as {
+    id: number;
+    volume_value: number;
+    volume_unit: string | null;
+    split_from_operation_id: number | null;
+    project_id: number | null;
+    part_id: number | null;
+    sop: string | null;
+    eop: string | null;
+  }[];
+  const years = new Set<number>();
+  const today = todayVolumePoint(now);
+  for (const op of ops) {
+    const rows = db
+      .prepare(
+        `SELECT year, volume_value, volume_value_before, effective_from_month, effective_from_week
+         FROM operation_volume_by_year WHERE operation_id = ?`
+      )
+      .all(op.id) as {
+      year: number;
+      volume_value: number;
+      volume_value_before: number | null;
+      effective_from_month: number | null;
+      effective_from_week: number | null;
+    }[];
+    const coveredYears = new Set<number>();
+    if (rows.length > 0) {
+      for (const row of rows) {
+        coveredYears.add(Number(row.year));
+        if (yearRowHasForwardVolume(row, now)) years.add(Number(row.year));
+      }
+    }
+    if (op.split_from_operation_id != null) continue;
+    for (const year of productionYearsFromToday(op.sop, op.eop, today)) {
+      if (coveredYears.has(year)) continue;
+      const resolved = resolveOperationVolumeForYear(
+        {
+          operation_id: op.id,
+          project_id: op.project_id,
+          part_id: op.part_id,
+          volume_value: Number(op.volume_value) || 0,
+          volume_unit: op.volume_unit || 'annual',
+          split_from_operation_id: null,
+        },
+        year,
+        null,
+        null,
+        false
+      );
+      if (Number(resolved.volume_value) > VOLUME_EPS) years.add(year);
+    }
+  }
+  return { blocked: years.size > 0, years: [...years].sort((a, b) => a - b) };
+}
+
+/**
+ * Jednorazowo przenosi wolumen od bieżącej daty z maszyn nieaktywnych na jednoznacznego spadkobiercę.
+ * Przypadki z wieloma kandydatami zostają bez zmian i trafiają do logu.
+ */
+export function repairInactiveForwardVolumesOnce(now = new Date()): { moved: number; ambiguous: string[] } {
+  const existing = db.prepare(`SELECT value FROM admin_settings WHERE key = 'inactive_volume_repair_v1'`).get() as
+    | { value?: string }
+    | undefined;
+  if (existing) return { moved: 0, ambiguous: [] };
+
+  const sources = db
+    .prepare(
+      `SELECT DISTINCT o.id
+       FROM operations o
+       JOIN machines m ON m.id = o.machine_id
+       WHERE lower(COALESCE(m.status, '')) = 'inactive'`
+    )
+    .all() as { id: number }[];
+
+  let moved = 0;
+  const ambiguous: string[] = [];
+  for (const source of sources) {
+    const rows = db
+      .prepare(
+        `SELECT year, volume_value, volume_unit, volume_value_before, effective_from_month, effective_from_week
+         FROM operation_volume_by_year WHERE operation_id = ?`
+      )
+      .all(source.id) as {
+      year: number;
+      volume_value: number;
+      volume_unit: string;
+      volume_value_before: number | null;
+      effective_from_month: number | null;
+      effective_from_week: number | null;
+    }[];
+    const forwardYears = rows.filter((row) => yearRowHasForwardVolume(row, now)).map((row) => Number(row.year));
+    if (forwardYears.length === 0) continue;
+    const heir = resolveVolumeHeir(source.id);
+    const op = loadOpMachine(source.id);
+    const fromLabel = op ? machineLabelOf(op) : String(source.id);
+    if (!heir.ok) {
+      ambiguous.push(`maszyna ${fromLabel}, operacja #${source.id}, lata ${forwardYears.join(', ')}: ${heir.error}`);
+      continue;
+    }
+    if (heir.heirOperationId === source.id) {
+      ambiguous.push(`maszyna ${fromLabel}, operacja #${source.id}: brak innej operacji w drzewie alokacji.`);
+      continue;
+    }
+    for (const year of forwardYears) {
+      mergeSplitChildYearVolumeIntoParent(heir.heirOperationId, source.id, year);
+      db.prepare(
+        `INSERT OR REPLACE INTO operation_volume_by_year (operation_id, year, volume_value, volume_unit, source)
+         VALUES (?, ?, 0, 'weekly', 'allocation')`
+      ).run(source.id, year);
+    }
+    moved++;
+  }
+
+  db.prepare(
+    `INSERT INTO admin_settings (key, value) VALUES ('inactive_volume_repair_v1', ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+  ).run(JSON.stringify({ at: new Date().toISOString(), moved, ambiguous }));
+  saveDb();
+  if (ambiguous.length) {
+    console.warn('[capacity] Wolumeny na maszynach nieaktywnych wymagają ręcznego wskazania spadkobiercy:\n' + ambiguous.join('\n'));
+  }
+  return { moved, ambiguous };
 }
 
 /** Scala wolumen jednego roku z operacji-dziecka alokacji z powrotem do rodzica. */

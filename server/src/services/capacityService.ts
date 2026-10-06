@@ -102,6 +102,8 @@ export type CapacityComputeShared = {
   includeRfqMachineIds: number[];
   /** Cache udziałów SAP: klucz = year|month|week|contract */
   callOffShareCache?: Map<string, Map<number, number>>;
+  /** W scenariuszu: podziały ze snapshotu nadpisują indeks produkcyjny, żeby nowe alokacje wchodziły do rodziny wolumenu. */
+  allocationSplitIndex?: AllocationSplitIndex;
 };
 
 const CAPACITY_OPS_SELECT = `
@@ -389,6 +391,10 @@ function buildCapacityComputeShared(
     scenarioRfqMachineIds: [],
     includeRfqMachineIds,
     callOffShareCache: new Map(),
+    allocationSplitIndex:
+      scenario != null
+        ? mergeAllocationSplitIndexes(buildAllocationSplitIndexFromOperations(operations), ensureAllocationSplitIndex())
+        : undefined,
   };
 }
 
@@ -957,11 +963,17 @@ function isAllocationVolumeSource(source: string | null | undefined): boolean {
 let allocationSplitParentById: Map<number, number | null> | null = null;
 let allocationChildrenByParent: Map<number, number[]> | null = null;
 
+type AllocationSplitIndex = {
+  parentById: Map<number, number | null>;
+  childrenByParent: Map<number, number[]>;
+};
+
 type AllocationShareCacheEntry = {
   year: number;
   activeMonth: number | undefined;
   activeWeek: number | undefined;
   settingsKey: string;
+  splitIndex?: AllocationSplitIndex;
   shares: Map<number, number>;
 };
 
@@ -1156,7 +1168,8 @@ function getAllocationFamilyShareMap(
   year: number,
   settings: WorkingDaysRow,
   activeMonth?: number,
-  activeWeek?: number
+  activeWeek?: number,
+  splitIndex?: AllocationSplitIndex
 ): Map<number, number> {
   const sk = settingsCacheKey(settings);
   const cached = allocationShareCache.get(volumeMap);
@@ -1165,16 +1178,18 @@ function getAllocationFamilyShareMap(
     cached.year === year &&
     cached.activeMonth === activeMonth &&
     cached.activeWeek === activeWeek &&
-    cached.settingsKey === sk
+    cached.settingsKey === sk &&
+    cached.splitIndex === splitIndex
   ) {
     return cached.shares;
   }
-  const shares = buildAllocationFamilyShareMap(volumeMap, year, settings, activeMonth, activeWeek);
+  const shares = buildAllocationFamilyShareMap(volumeMap, year, settings, activeMonth, activeWeek, splitIndex);
   allocationShareCache.set(volumeMap, {
     year,
     activeMonth,
     activeWeek,
     settingsKey: sk,
+    splitIndex,
     shares,
   });
   return shares;
@@ -1191,7 +1206,8 @@ function allocationFamilyShareForOperation(
   volumeMap: Map<number, OperationYearVolumeRow> | null | undefined,
   settings: WorkingDaysRow,
   activeMonth?: number,
-  activeWeek?: number
+  activeWeek?: number,
+  splitIndex?: AllocationSplitIndex
 ): number | null {
   if (!opYearOverride) return null;
   if (!volumeMap || volumeMap.size === 0) return null;
@@ -1201,7 +1217,7 @@ function allocationFamilyShareForOperation(
     // Nowa zawartość mapy — wymuś przebudowę cache udziałów.
     allocationShareCache.delete(volumeMap);
   }
-  const shares = getAllocationFamilyShareMap(volumeMap, year, settings, activeMonth, activeWeek);
+  const shares = getAllocationFamilyShareMap(volumeMap, year, settings, activeMonth, activeWeek, splitIndex);
   const share = shares.get(operationId);
   return share != null && Number.isFinite(share) ? share : null;
 }
@@ -1227,7 +1243,9 @@ export function resolveOperationVolumeForYear(
   /** Mapa nadpisań roku (do proporcji alokacji przy wolumenach kontraktowych). */
   opVolumeMapForYear?: Map<number, OperationYearVolumeRow> | null,
   /** false = nie skaluj alokacji do kontraktu (np. liczenie udziałów SAP). */
-  applyAllocationContractFraction: boolean = true
+  applyAllocationContractFraction: boolean = true,
+  /** Rodzina alokacji ze scenariusza. Bez tego indeksu nowe podziały ze scenariusza nie wchodzą do udziału i zostają 100% detalu. */
+  allocationSplitIndex?: AllocationSplitIndex | null
 ): {
   volume_value: number;
   volume_unit: 'annual' | 'monthly' | 'weekly';
@@ -1290,7 +1308,8 @@ export function resolveOperationVolumeForYear(
         opVolumeMapForYear ?? null,
         settings,
         activeMonth,
-        activeWeek
+        activeWeek,
+        allocationSplitIndex ?? undefined
       );
       if (share != null && Number.isFinite(share)) {
         return {
@@ -1922,7 +1941,9 @@ export function getMachineCapacitiesForYear(
         volumePrefetch,
         activeMonth,
         activeWeek,
-        callOffVolumes ? null : volumeMap
+        callOffVolumes ? null : volumeMap,
+        true,
+        computeShared.allocationSplitIndex
       );
       if (
         !callOffSapActive &&
@@ -2272,6 +2293,10 @@ export function getMachineLoadComputationDetails(
     baseOperations,
     loadBaselineMaterialDemandOperations(scenarioSnapshot ?? null, allowedBaselineProjects)
   );
+  const allocationSplitIndex =
+    scenarioSnapshot != null
+      ? mergeAllocationSplitIndexes(buildAllocationSplitIndexFromOperations(operations), ensureAllocationSplitIndex())
+      : undefined;
 
   const volumeMap = (() => {
     if (scenarioSnapshot != null) {
@@ -2363,7 +2388,9 @@ export function getMachineLoadComputationDetails(
       undefined,
       undefined,
       undefined,
-      volumeMap
+      volumeMap,
+      true,
+      allocationSplitIndex
     );
     if (
       !shouldIncludeOperationInCapacity(
@@ -3567,6 +3594,10 @@ function accumulateScopeBreakdown(
       return new Map(volumeByYear.map((v) => [v.operation_id, v]));
     }
   })();
+  const allocationSplitIndex =
+    opts.scenarioSnapshot != null
+      ? mergeAllocationSplitIndexes(buildAllocationSplitIndexFromOperations(operations), ensureAllocationSplitIndex())
+      : undefined;
   const callOffOpShare = opts.callOffVolumes
     ? buildCallOffOperationShares(
         operations,
@@ -3628,7 +3659,9 @@ function accumulateScopeBreakdown(
       undefined,
       opts.activeMonth,
       opts.activeWeek,
-      opts.callOffVolumes ? null : volumeMap
+      opts.callOffVolumes ? null : volumeMap,
+      true,
+      allocationSplitIndex
     );
     if (
       !callOffSapActive &&

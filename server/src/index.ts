@@ -5,6 +5,7 @@ import compression from 'compression';
 import fs from 'fs';
 import path from 'path';
 import { initDb, saveDb } from './db/connection.js';
+import { repairInactiveForwardVolumesOnce } from './services/allocationService.js';
 import { bootstrapAuthIfEmpty, forceResetBootstrapAdminPassword } from './auth/userService.js';
 import { optionalAuth, requireAuth, requirePermissionForResource, requireAdminAccess, enforceProjectMutationScope } from './middleware/auth.js';
 import { authRouter } from './routes/auth.js';
@@ -132,6 +133,7 @@ const PORT = process.env.PORT || 3001;
 
 async function main() {
   await initDb();
+  repairInactiveForwardVolumesOnce();
   await bootstrapAuthIfEmpty();
   await forceResetBootstrapAdminPassword();
   saveDb();

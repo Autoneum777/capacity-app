@@ -30,6 +30,7 @@ import {
   parseEuNumber,
   parseSapRoutingBuffer,
 } from '../services/sapRoutingParser.js';
+import { forwardVolumeBlockForMachine } from '../services/allocationService.js';
 
 export const machinesRouter = Router();
 const routingUpload = multer({
@@ -1187,6 +1188,14 @@ machinesRouter.put('/:id', (req, res) => {
   }
   const oee_override = body.oee_override !== undefined ? (body.oee_override == null ? null : Number(body.oee_override)) : row.oee_override;
   const status = body.status !== undefined ? normalizeMachineStatus(body.status) : normalizeMachineStatus(row.status, 'active');
+  if (status === 'inactive' && String(row.status ?? '').toLowerCase() !== 'inactive') {
+    const forward = forwardVolumeBlockForMachine(id);
+    if (forward.blocked) {
+      return res.status(400).json({
+        error: `Nie można dezaktywować maszyny: od bieżącej daty zostaje wolumen (lata: ${forward.years.join(', ')}). Najpierw przenieś ten wolumen na aktywną maszynę. Lata historyczne nie blokują dezaktywacji.`,
+      });
+    }
+  }
   let location = row.location;
   if (body.location !== undefined) {
     const locRes = normalizeMachineLineLocationOptional(body.location);

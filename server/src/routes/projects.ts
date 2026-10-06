@@ -2046,9 +2046,10 @@ projectsRouter.delete('/:projectId/operations/:opId', (req, res) => {
     .get(opId, projectId) as { id: number; machine_id: number | null; part_id: number | null } | undefined;
   if (!opRow) return res.status(404).json({ error: 'Not found' });
 
-  const result = deleteOperationInProject(projectId, opId);
+  const heirOperationId = Number(req.query.heirOperationId);
+  const result = deleteOperationInProject(projectId, opId, Number.isFinite(heirOperationId) ? heirOperationId : undefined);
   if (!result.ok) {
-    return res.status(result.statusCode ?? 400).json({ error: result.error });
+    return res.status(result.statusCode ?? 400).json({ error: result.error, code: result.code, candidates: result.candidates });
   }
   saveDb();
   insertProjectNote(projectId, `Automatyczna zmiana: usunięto operację #${opId}.`, actor, 'auto', undefined, {
@@ -2056,7 +2057,7 @@ projectsRouter.delete('/:projectId/operations/:opId', (req, res) => {
     machineId: opRow.machine_id,
     partId: opRow.part_id,
   });
-  res.status(204).send();
+  res.json({ ok: true, message: result.message ?? null });
 });
 
 // Operation volume by year (override dla wybranych lat; brak wpisu = używany volume_value/volume_unit operacji)
@@ -2115,9 +2116,15 @@ projectsRouter.put('/:projectId/operations/:opId/volumes', (req, res) => {
   if (parentId != null && Number.isFinite(parentId) && Number.isFinite(volume_value) && volume_value <= 1e-9) {
     const parent = db.prepare('SELECT id FROM operations WHERE id = ? AND project_id = ?').get(parentId, projectId);
     if (parent) {
-      const result = deleteOperationYearVolumeInProject(projectId, opId, year);
+      const heirFromBody = Number(body.heirOperationId);
+      const result = deleteOperationYearVolumeInProject(
+        projectId,
+        opId,
+        year,
+        Number.isFinite(heirFromBody) ? heirFromBody : undefined
+      );
       if (!result.ok) {
-        return res.status(result.statusCode ?? 400).json({ error: result.error });
+        return res.status(result.statusCode ?? 400).json({ error: result.error, code: result.code, candidates: result.candidates });
       }
       saveDb();
       const row = db.prepare('SELECT year, volume_value, volume_unit FROM operation_volume_by_year WHERE operation_id = ? AND year = ?').get(opId, year) as any;
@@ -2154,9 +2161,10 @@ projectsRouter.delete('/:projectId/operations/:opId/volumes/:year', (req, res) =
     .prepare('SELECT id, machine_id, part_id FROM operations WHERE id = ? AND project_id = ?')
     .get(opId, projectId) as { id: number; machine_id: number | null; part_id: number | null } | undefined;
   if (!op) return res.status(404).json({ error: 'Not found' });
-  const result = deleteOperationYearVolumeInProject(projectId, opId, year);
+  const heirOperationId = Number(req.query.heirOperationId);
+  const result = deleteOperationYearVolumeInProject(projectId, opId, year, Number.isFinite(heirOperationId) ? heirOperationId : undefined);
   if (!result.ok) {
-    return res.status(result.statusCode ?? 400).json({ error: result.error });
+    return res.status(result.statusCode ?? 400).json({ error: result.error, code: result.code, candidates: result.candidates });
   }
   saveDb();
   insertProjectNote(projectId, `Automatyczna zmiana: usunięto wolumen operacji #${opId} dla roku ${year}.`, actor, 'auto', undefined, {
@@ -2164,7 +2172,7 @@ projectsRouter.delete('/:projectId/operations/:opId/volumes/:year', (req, res) =
     machineId: op.machine_id,
     partId: op.part_id,
   });
-  res.status(204).send();
+  res.json({ ok: true, message: result.message ?? null });
 });
 
 // Notes

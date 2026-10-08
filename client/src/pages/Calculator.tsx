@@ -7,6 +7,7 @@ import { useAuth } from '../context/AuthContext';
 import { useI18n } from '../context/I18nContext';
 import { localeDateTime } from '../i18n/reportLabels';
 import { api } from '../api/client';
+import ScenarioMoveReport from './ScenarioMoveReport';
 import SearchableSelect from '../components/SearchableSelect';
 import MultiSelectFilter from '../components/MultiSelectFilter';
 import MachineGroupsMultiFilter from '../components/MachineGroupsMultiFilter';
@@ -1183,6 +1184,7 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
   const [reportIncludeSystemSettings, setReportIncludeSystemSettings] = useState(true);
   const [reportFormat, setReportFormat] = useState<'pdf' | 'excel'>('pdf');
   const [reportModalOpen, setReportModalOpen] = useState(false);
+  const [reportKind, setReportKind] = useState<'capacity' | 'moves'>('capacity');
   const [reportGenerating, setReportGenerating] = useState(false);
   const [viewPdfGenerating, setViewPdfGenerating] = useState(false);
   const [reportMessage, setReportMessage] = useState<string | null>(null);
@@ -2978,9 +2980,12 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
           {canDownloadReports && (
             <button
               type="button"
-              onClick={() => setReportModalOpen(true)}
+              onClick={() => {
+                if (!scenarioActive) setReportKind('capacity');
+                setReportModalOpen(true);
+              }}
               className="calculator-primary-btn"
-              disabled={loading || !data || filteredMachines.length === 0}
+              disabled={loading || !data || (!scenarioActive && filteredMachines.length === 0)}
             >
               {t('calculator.report')}
             </button>
@@ -3189,8 +3194,28 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
         <div onMouseDown={(e) => { if (e.target === e.currentTarget) setReportModalOpen(false); }} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 120, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
           <div onMouseDown={(e) => e.stopPropagation()} style={{ background: 'white', width: 'min(920px, 94vw)', maxHeight: '90vh', overflow: 'auto', borderRadius: 10, padding: '1rem 1.25rem' }}>
             <h3 style={{ marginTop: 0 }}>
-              {callOffMode ? t('reports.calculator.configTitleCallOff') : t('reports.calculator.configTitle')}
+              {reportKind === 'moves' && scenarioActive
+                ? t('layout.moveReport')
+                : callOffMode
+                  ? t('reports.calculator.configTitleCallOff')
+                  : t('reports.calculator.configTitle')}
             </h3>
+            {scenarioActive && scenarioId != null ? (
+              <div style={{ marginBottom: 12, display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+                <label>
+                  <input type="radio" name="reportKind" checked={reportKind === 'capacity'} onChange={() => setReportKind('capacity')} />{' '}
+                  {t('scenarios.moveReportLoad')}
+                </label>
+                <label>
+                  <input type="radio" name="reportKind" checked={reportKind === 'moves'} onChange={() => setReportKind('moves')} />{' '}
+                  {t('scenarios.moveReportMoves')}
+                </label>
+              </div>
+            ) : null}
+            {reportKind === 'moves' && scenarioActive && scenarioId != null ? (
+              <ScenarioMoveReport scenarioId={scenarioId} />
+            ) : (
+            <>
             <div style={{ marginBottom: 10, display: 'flex', gap: 12, flexWrap: 'wrap' }}>
               <label><input type="radio" name="reportFormat" checked={reportFormat === 'pdf'} onChange={() => setReportFormat('pdf')} /> {t('reports.calculator.formatPdf')}</label>
               <label><input type="radio" name="reportFormat" checked={reportFormat === 'excel'} onChange={() => setReportFormat('excel')} /> {t('reports.calculator.formatExcel')}</label>
@@ -3231,11 +3256,15 @@ export default function Calculator({ callOffComparisonId }: CalculatorProps = {}
             <p style={{ margin: '0 0 10px', fontSize: 12, color: '#666' }}>
               {callOffMode ? t('reports.calculator.configHintCallOff') : t('reports.calculator.configHint')}
             </p>
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+            </>
+            )}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
               <button type="button" onClick={() => setReportModalOpen(false)} style={{ padding: '0.45rem 0.8rem', background: '#9e9e9e', color: 'white', border: 'none', borderRadius: 6 }}>{t('common.cancel')}</button>
-              <button type="button" onClick={generateReport} disabled={reportGenerating} style={{ padding: '0.45rem 0.8rem', background: '#1976d2', color: 'white', border: 'none', borderRadius: 6 }}>
-                {reportGenerating ? t('common.generating') : reportFormat === 'pdf' ? t('reports.calculator.generatePdf') : t('reports.calculator.generateExcel')}
-              </button>
+              {!(reportKind === 'moves' && scenarioActive) ? (
+                <button type="button" onClick={generateReport} disabled={reportGenerating} style={{ padding: '0.45rem 0.8rem', background: '#1976d2', color: 'white', border: 'none', borderRadius: 6 }}>
+                  {reportGenerating ? t('common.generating') : reportFormat === 'pdf' ? t('reports.calculator.generatePdf') : t('reports.calculator.generateExcel')}
+                </button>
+              ) : null}
             </div>
           </div>
         </div>
@@ -4338,6 +4367,13 @@ function isZeroVolumePreallocEligible(op: any, yearItem: number, weeklyOf: (op: 
   return isYearInProjectSopEop(op.sop ?? '', op.eop ?? '', yearItem);
 }
 
+function formatAllocationYearSpan(years: number[]): string {
+  const sorted = [...years].sort((a, b) => a - b);
+  if (sorted.length <= 2) return sorted.join(', ');
+  const contiguous = sorted.every((y, i) => i === 0 || y === sorted[i - 1] + 1);
+  return contiguous ? `${sorted[0]}–${sorted[sorted.length - 1]}` : sorted.join(', ');
+}
+
 function buildAllocationContributors(
   groupOps: any[],
   repOpId: number,
@@ -4565,7 +4601,7 @@ function AllocationModal({
       api.allocation
         .candidates(machineId, { year, maxLoad: 90, includeOverloadedAlternatives: true, ...allocScenarioParams })
         .then((r) => r.candidates || []),
-      api.machines.operations(machineId, { year, ...allocScenarioParams }),
+      api.machines.operations(machineId, { year, includeVolumeYears: true, ...allocScenarioParams }),
       api.alternatives.list(machineId),
       api.machines.get(machineId).catch(() => null),
     ])
@@ -4663,16 +4699,17 @@ function AllocationModal({
   const operationSopEopYears = useMemo(() => {
     if (selectedOps.length === 0) return yearRange;
     const union = new Set<number>();
-    let anySopEop = false;
+    let any = false;
     for (const op of selectedOps) {
-      const { years } = sopEopYearsRange(op.sop ?? '', op.eop ?? '');
+      const fromVolumes = Array.isArray(op.volume_years)
+        ? op.volume_years.map((y: unknown) => Number(y)).filter((y: number) => Number.isFinite(y) && y > 0)
+        : [];
+      const years = fromVolumes.length > 0 ? fromVolumes : sopEopYearsRange(op.sop ?? '', op.eop ?? '').years;
       if (!years.length) continue;
-      anySopEop = true;
-      for (const y of years) {
-        if (yearRange.includes(y)) union.add(y);
-      }
+      any = true;
+      for (const y of years) union.add(y);
     }
-    if (!anySopEop) return yearRange;
+    if (!any) return yearRange;
     return [...union].sort((a, b) => a - b);
   }, [selectedOps, yearRange]);
 
@@ -4981,6 +5018,10 @@ function AllocationModal({
     setMessage(null);
     setExecuting(true);
     (async () => {
+      const allocationBatchId =
+        scenarioId != null && scenarioId > 0
+          ? `alloc-${scenarioId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+          : undefined;
       const workWeeksBase = effectiveLoadHint?.working_weeks_per_year ?? loadHint?.working_weeks_per_year ?? 48;
       const multiYearBatch = yearsToExecute.length > 1;
       const withEffectiveFrom = <T extends Record<string, unknown>>(body: T, yearItem: number): T => {
@@ -5128,6 +5169,7 @@ function AllocationModal({
               cycleTimeSecondsOnTarget?: number | null;
               useAlternativeCycleOnTarget?: boolean;
               scenarioId?: number;
+              batchId?: string;
               useContractualVolumes?: boolean;
             } = {
               operationId: c.id,
@@ -5137,7 +5179,10 @@ function AllocationModal({
               year: plan.yearItem,
               ...cyclePayload,
             };
-            if (scenarioId != null && scenarioId > 0) body.scenarioId = scenarioId;
+            if (scenarioId != null && scenarioId > 0) {
+              body.scenarioId = scenarioId;
+              if (allocationBatchId) body.batchId = allocationBatchId;
+            }
             if (useContractualVolumes) body.useContractualVolumes = true;
             await api.allocation.execute(withEffectiveFrom(body, plan.yearItem));
             continue;
@@ -5155,6 +5200,7 @@ function AllocationModal({
               cycleTimeSecondsOnTarget?: number | null;
               useAlternativeCycleOnTarget?: boolean;
               scenarioId?: number;
+              batchId?: string;
               useContractualVolumes?: boolean;
             } = {
               operationId: c.id,
@@ -5164,7 +5210,10 @@ function AllocationModal({
               year: plan.yearItem,
               ...cyclePayload,
             };
-            if (scenarioId != null && scenarioId > 0) body.scenarioId = scenarioId;
+            if (scenarioId != null && scenarioId > 0) {
+              body.scenarioId = scenarioId;
+              if (allocationBatchId) body.batchId = allocationBatchId;
+            }
             if (useContractualVolumes) body.useContractualVolumes = true;
             await api.allocation.execute(withEffectiveFrom(body, plan.yearItem));
             remainingWeekly -= partWeekly;
@@ -5278,6 +5327,7 @@ function AllocationModal({
             cycleTimeSecondsOnTarget?: number | null;
             useAlternativeCycleOnTarget?: boolean;
             scenarioId?: number;
+            batchId?: string;
             useContractualVolumes?: boolean;
           } = {
             operationId: c.id,
@@ -5287,7 +5337,10 @@ function AllocationModal({
             year: plan.yearItem,
             ...cyclePayload,
           };
-          if (scenarioId != null && scenarioId > 0) body.scenarioId = scenarioId;
+          if (scenarioId != null && scenarioId > 0) {
+            body.scenarioId = scenarioId;
+            if (allocationBatchId) body.batchId = allocationBatchId;
+          }
           if (useContractualVolumes) body.useContractualVolumes = true;
           await api.allocation.execute(withEffectiveFrom(body, plan.yearItem));
           continue;
@@ -5305,6 +5358,7 @@ function AllocationModal({
             cycleTimeSecondsOnTarget?: number | null;
             useAlternativeCycleOnTarget?: boolean;
             scenarioId?: number;
+            batchId?: string;
             useContractualVolumes?: boolean;
           } = {
             operationId: c.id,
@@ -5314,7 +5368,10 @@ function AllocationModal({
             year: plan.yearItem,
             ...cyclePayload,
           };
-          if (scenarioId != null && scenarioId > 0) body.scenarioId = scenarioId;
+          if (scenarioId != null && scenarioId > 0) {
+            body.scenarioId = scenarioId;
+            if (allocationBatchId) body.batchId = allocationBatchId;
+          }
           if (useContractualVolumes) body.useContractualVolumes = true;
           await api.allocation.execute(withEffectiveFrom(body, plan.yearItem));
           remainingWeekly -= partWeekly;
@@ -5424,16 +5481,9 @@ function AllocationModal({
               </div>
               {selectedOps.length > 0 && operationSopEopYears.length > 0 && (
                 <p style={{ margin: '0 0 8px', fontSize: 12, color: '#666' }}>
-                  {selectedOps.length === 1
-                    ? t('projectDetailExtra.sopEopYears', {
-                        sop: selectedOps[0].sop ?? '—',
-                        eop: selectedOps[0].eop ?? '—',
-                        years: operationSopEopYears.join(', '),
-                      })
-                    : t('calculator.allocation.sopEopUnion', {
-                        count: selectedOps.length,
-                        years: operationSopEopYears.join(', '),
-                      })}
+                  {t('calculator.allocation.volumeYearsHint', {
+                    years: formatAllocationYearSpan(operationSopEopYears),
+                  })}
                 </p>
               )}
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
@@ -5470,7 +5520,7 @@ function AllocationModal({
                 {t('calculator.allocation.selectedYearsSummary', {
                   years:
                     selectedYears.length > 0
-                      ? [...selectedYears].sort((a, b) => a - b).join(', ')
+                      ? formatAllocationYearSpan(selectedYears)
                       : t('calculator.allocation.selectedYearsNone'),
                 })}
               </div>

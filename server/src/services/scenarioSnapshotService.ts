@@ -1,4 +1,6 @@
 import { db, saveDb } from '../db/connection.js';
+import { formatDetailSapAliasLabel, type ReferenceDisplayMode } from '../utils/detailLabel.js';
+import { loadReferenceDisplayMode } from '../utils/referenceDisplayMode.js';
 import { normalizeVolumeOrigin, type VolumeEntryOrigin } from './capacityService.js';
 import {
   releaseAllReservationsForScenario,
@@ -39,6 +41,53 @@ export type ScenarioBundle = {
   part_designations: any[];
   /** Historia zmian w ramach scenariusza (nie miesza się z produkcyjną historią). */
   audit_log?: ScenarioAuditEntry[];
+  /**
+   * Nr linii (machines.location) zamrożony w scenariuszu.
+   * Zmiana w produkcji nie zmienia scenariusza i odwrotnie. Wgranie scenariusza do produkcji linii nie nadpisuje.
+   */
+  machine_locations?: { machine_id: number; location: string | null }[];
+  /** Status maszyny zamrożony w scenariuszu. Produkcja i inne scenariusze go nie zmieniają. */
+  machine_statuses?: { machine_id: number; status: 'active' | 'inactive' | 'RFQ' }[];
+  /** Pakiety alokacji do cofnięcia, od najstarszego. Ostatni element to najnowszy ruch. */
+  allocation_moves?: ScenarioAllocationMove[];
+  /** Zmiany wolumenu detalu do cofnięcia. Ostatni element po dacie jest najnowszy. */
+  volume_edits?: ScenarioVolumeEdit[];
+};
+
+export type ScenarioVolumeEdit = {
+  id: number;
+  at: string;
+  partId: number;
+  projectId: number | null;
+  applyProduction: boolean;
+  applyContract: boolean;
+  years: number[];
+  /** override = zapis wartości, project = powrót do wolumenu projektu. */
+  mode: 'override' | 'project';
+  before: {
+    volume_mode: string;
+    contract_volume_mode: string;
+    part_volume_by_year: any[];
+    part_volume_contract_by_year: any[];
+  };
+};
+
+export type ScenarioAllocationMoveStep = {
+  sourceOperationId: number;
+  childOperationId: number;
+  year: number;
+  sourceMachineId: number;
+  targetMachineId: number;
+  partId: number | null;
+  /** Wiersz roku rodzica sprzed ruchu. null = stare wpisy, cofnięcie dodaje wolumen dziecka z powrotem. */
+  parentYearBefore: any | null;
+};
+
+export type ScenarioAllocationMove = {
+  id: number;
+  batchId: string;
+  at: string;
+  steps: ScenarioAllocationMoveStep[];
 };
 
 export function exportLiveScenarioBundle(): ScenarioBundle {
@@ -80,6 +129,16 @@ export function exportLiveScenarioBundle(): ScenarioBundle {
   } catch {
     project_eop_extensions = [];
   }
+  const machineRows = db.prepare('SELECT id AS machine_id, location, status FROM machines ORDER BY id').all() as {
+    machine_id: number;
+    location: string | null;
+    status: string | null;
+  }[];
+  const machine_locations = machineRows.map((m) => ({ machine_id: m.machine_id, location: m.location }));
+  const machine_statuses = machineRows.map((m) => ({
+    machine_id: m.machine_id,
+    status: normalizeScenarioLineStatus(m.status) ?? 'active',
+  }));
   const desIds = new Set<number>();
   for (const p of parts) {
     if (p.designation_id != null && Number.isFinite(Number(p.designation_id))) desIds.add(Number(p.designation_id));
@@ -108,6 +167,8 @@ export function exportLiveScenarioBundle(): ScenarioBundle {
     project_eop_extensions,
     part_designations,
     audit_log: [],
+    machine_locations,
+    machine_statuses,
   };
 }
 
@@ -119,6 +180,7 @@ export function parseScenarioSnapshotJson(raw: string): ScenarioBundle {
     if (!Array.isArray(b.project_volumes_contract)) b.project_volumes_contract = [];
     if (!Array.isArray(b.part_volume_contract_by_year)) b.part_volume_contract_by_year = [];
     if (!Array.isArray(b.part_volume_contract_share_by_year)) b.part_volume_contract_share_by_year = [];
+    if (!Array.isArray(b.volume_edits)) b.volume_edits = [];
     return b;
   }
   return {
@@ -138,7 +200,133 @@ export function parseScenarioSnapshotJson(raw: string): ScenarioBundle {
     project_eop_extensions: [],
     part_designations: [],
     audit_log: [],
+    machine_locations: Array.isArray(o?.machine_locations) ? o.machine_locations : [],
+    machine_statuses: Array.isArray(o?.machine_statuses) ? o.machine_statuses : [],
+    allocation_moves: Array.isArray(o?.allocation_moves) ? o.allocation_moves : [],
+    volume_edits: Array.isArray(o?.volume_edits) ? o.volume_edits : [],
   };
+}
+
+/** Mapa linii ze snapshotu. Brak pola = scenariusz sprzed tej funkcji (użyj produkcji). */
+export function scenarioLocationByMachineId(bundle: ScenarioBundle | null | undefined): Map<number, string | null> | null {
+  if (!bundle || !Array.isArray(bundle.machine_locations)) return null;
+  const map = new Map<number, string | null>();
+  for (const row of bundle.machine_locations) {
+    const id = Number(row?.machine_id);
+    if (!Number.isFinite(id) || id <= 0) continue;
+    const raw = row.location == null ? '' : String(row.location).trim();
+    map.set(id, raw || null);
+  }
+  return map;
+}
+
+/**
+ * Dopisuje maszyny, których nie ma w snapshotcie, bieżącą linią z produkcji.
+ * Istniejących wpisów nie zmienia. Zwraca true, gdy snapshot wymaga zapisu.
+ */
+export function ensureScenarioMachineLocations(bundle: ScenarioBundle): boolean {
+  const had = Array.isArray(bundle.machine_locations);
+  const byId = new Map<number, string | null>();
+  if (had) {
+    for (const row of bundle.machine_locations!) {
+      const id = Number(row?.machine_id);
+      if (!Number.isFinite(id) || id <= 0) continue;
+      const raw = row.location == null ? '' : String(row.location).trim();
+      byId.set(id, raw || null);
+    }
+  }
+  const prod = db.prepare('SELECT id, location FROM machines ORDER BY id').all() as { id: number; location: string | null }[];
+  let changed = !had;
+  const next: { machine_id: number; location: string | null }[] = [];
+  const seen = new Set<number>();
+  for (const m of prod) {
+    const id = Number(m.id);
+    if (!Number.isFinite(id) || id <= 0) continue;
+    seen.add(id);
+    if (byId.has(id)) next.push({ machine_id: id, location: byId.get(id) ?? null });
+    else {
+      const raw = m.location == null ? '' : String(m.location).trim();
+      next.push({ machine_id: id, location: raw || null });
+      changed = true;
+    }
+  }
+  for (const [id, location] of byId) {
+    if (!seen.has(id)) next.push({ machine_id: id, location });
+  }
+  if (changed) bundle.machine_locations = next;
+  return changed;
+}
+
+export function scenarioStatusByMachineId(
+  bundle: ScenarioBundle | null | undefined
+): Map<number, 'active' | 'inactive' | 'RFQ'> | null {
+  if (!bundle || !Array.isArray(bundle.machine_statuses)) return null;
+  const map = new Map<number, 'active' | 'inactive' | 'RFQ'>();
+  for (const row of bundle.machine_statuses) {
+    const id = Number(row?.machine_id);
+    const status = normalizeScenarioLineStatus(row?.status);
+    if (!Number.isFinite(id) || id <= 0 || !status) continue;
+    map.set(id, status);
+  }
+  return map;
+}
+
+/** Dopisuje brakujące maszyny bieżącym statusem produkcji. Istniejących nie nadpisuje. */
+export function ensureScenarioMachineStatuses(bundle: ScenarioBundle): boolean {
+  const had = Array.isArray(bundle.machine_statuses);
+  const byId = new Map<number, 'active' | 'inactive' | 'RFQ'>();
+  if (had) {
+    for (const row of bundle.machine_statuses!) {
+      const id = Number(row?.machine_id);
+      const status = normalizeScenarioLineStatus(row?.status);
+      if (!Number.isFinite(id) || id <= 0 || !status) continue;
+      byId.set(id, status);
+    }
+  }
+  const prod = db.prepare('SELECT id, status FROM machines ORDER BY id').all() as { id: number; status: string | null }[];
+  let changed = !had;
+  const next: { machine_id: number; status: 'active' | 'inactive' | 'RFQ' }[] = [];
+  const seen = new Set<number>();
+  for (const m of prod) {
+    const id = Number(m.id);
+    if (!Number.isFinite(id) || id <= 0) continue;
+    seen.add(id);
+    if (byId.has(id)) next.push({ machine_id: id, status: byId.get(id)! });
+    else {
+      next.push({ machine_id: id, status: normalizeScenarioLineStatus(m.status) ?? 'active' });
+      changed = true;
+    }
+  }
+  for (const [id, status] of byId) {
+    if (!seen.has(id)) next.push({ machine_id: id, status });
+  }
+  if (changed) bundle.machine_statuses = next;
+  return changed;
+}
+
+/** Jednorazowo zamraża linie i statusy w scenariuszach utworzonych przed tymi polami. */
+export function backfillScenarioMachineLocations(): number {
+  const rows = db.prepare('SELECT id, snapshot FROM scenarios').all() as { id: number; snapshot: string }[];
+  let updated = 0;
+  for (const row of rows) {
+    let bundle: ScenarioBundle;
+    try {
+      bundle = parseScenarioSnapshotJson(row.snapshot);
+    } catch {
+      continue;
+    }
+    const locChanged = ensureScenarioMachineLocations(bundle);
+    const stChanged = ensureScenarioMachineStatuses(bundle);
+    if (!locChanged && !stChanged) continue;
+    try {
+      db.prepare('UPDATE scenarios SET snapshot = ? WHERE id = ?').run(JSON.stringify(bundle), row.id);
+      updated++;
+    } catch {
+      /* ignore broken row */
+    }
+  }
+  if (updated > 0) saveDb();
+  return updated;
 }
 
 export function cloneScenarioBundle(bundle: ScenarioBundle): ScenarioBundle {
@@ -204,6 +392,74 @@ export function pushScenarioAudit(
     machine_id: entry.machine_id ?? null,
     part_id: entry.part_id ?? null,
     operation_id: entry.operation_id ?? null,
+  });
+}
+
+/** Etykieta maszyny jak w historii: SAP (numer wewnętrzny), bez id z bazy. */
+export function scenarioAssignedMachineLabel(
+  machineId: number,
+  machineRow?: { sap_number?: string | null; internal_number?: string | number | null } | null
+): string {
+  const row =
+    machineRow ??
+    (db.prepare('SELECT sap_number, internal_number FROM machines WHERE id = ?').get(machineId) as
+      | { sap_number?: string | null; internal_number?: string | number | null }
+      | undefined);
+  const sap = String(row?.sap_number ?? '').trim();
+  const internal = row?.internal_number != null ? String(row.internal_number).trim() : '';
+  if (sap && internal) return `${sap} (${internal})`;
+  if (internal) return internal;
+  if (sap) return sap;
+  return String(machineId);
+}
+
+/** Oznaczenie detalu (SAP / alias) zamiast id części. */
+export function scenarioAssignedPartLabel(
+  bundle: ScenarioBundle,
+  partId: number | null | undefined,
+  refMode?: ReferenceDisplayMode
+): string {
+  const id = Number(partId);
+  if (!Number.isFinite(id) || id <= 0) return '';
+  const pt = (bundle.parts || []).find((p: any) => Number(p.id) === id);
+  if (!pt) return '';
+  const pd = (bundle.part_designations || []).find((d: any) => Number(d.id) === Number(pt.designation_id));
+  return formatDetailSapAliasLabel(
+    {
+      sap_number: pd?.sap_number ?? null,
+      alias: pd?.alias ?? null,
+      free_text: pd?.free_text ?? null,
+      designation: pt.designation ?? null,
+      id: pt.id,
+    },
+    refMode ?? loadReferenceDisplayMode()
+  );
+}
+
+const ALLOCATION_MOVE_NOTE =
+  /operacji #(\d+) przeniesiona na maszynę #(\d+), utworzono operację #(\d+), rok (\d+)/g;
+
+/** Stare notatki alokacji (id operacji i maszyny) pokazuje jako detal i numery maszyn. */
+export function humanizeScenarioHistoryNote(
+  note: string,
+  bundle: ScenarioBundle,
+  machineById?: Map<number, { sap_number?: string | null; internal_number?: string | number | null }>,
+  refMode?: ReferenceDisplayMode
+): string {
+  if (!note || !note.includes('operacji #')) return note;
+  return note.replace(ALLOCATION_MOVE_NOTE, (_all, opIdRaw, machineIdRaw, newOpRaw, year) => {
+    const ops = bundle.operations || [];
+    const sourceOp = ops.find((o: any) => Number(o.id) === Number(opIdRaw));
+    const childOp = ops.find((o: any) => Number(o.id) === Number(newOpRaw));
+    const partLabel = scenarioAssignedPartLabel(bundle, sourceOp?.part_id ?? childOp?.part_id, refMode);
+    const sourceMachineId = sourceOp?.machine_id != null ? Number(sourceOp.machine_id) : NaN;
+    const source = Number.isFinite(sourceMachineId)
+      ? scenarioAssignedMachineLabel(sourceMachineId, machineById?.get(sourceMachineId))
+      : '';
+    const target = scenarioAssignedMachineLabel(Number(machineIdRaw), machineById?.get(Number(machineIdRaw)));
+    const detail = partLabel ? `detalu ${partLabel}` : 'detalu';
+    const from = source ? ` z maszyny ${source}` : '';
+    return `${detail}${from} przeniesiona na maszynę ${target}, rok ${year}`;
   });
 }
 

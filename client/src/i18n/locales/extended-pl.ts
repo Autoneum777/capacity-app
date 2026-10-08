@@ -1403,6 +1403,7 @@ export const extendedPl: TranslationTree = {
     permDelete: 'Usuwanie',
     permDownload: 'Pobieranie',
     permCreateRfq: 'Tworzenie RFQ',
+    permViewConfidential: 'Poufne',
     permCalculator: 'Kalkulator',
     permMachines: 'Maszyny',
     permProjects: 'Projekty',
@@ -1419,6 +1420,8 @@ export const extendedPl: TranslationTree = {
     permRoleManagement: 'Zarządzanie rolami',
     permCreateRfqHint:
       'Tworzenie RFQ: użytkownik może tworzyć tylko projekty ze statusem RFQ oraz edytować detale, operacje i wolumeny w takich projektach.',
+    permConfidentialHint:
+      'Scenariusze → Poufne: podgląd, edycja i kalkulator scenariuszy oznaczonych jako confidential. Bez tego uprawnienia takie scenariusze nie są widoczne.',
     permAttachmentsDownloadHint:
       'Załączniki: Podgląd = lista w Administracji. Pobieranie = pobieranie plików załączników w projekcie. Wyłączenie Podglądu wyłącza też Pobieranie. Bez Pobierania przycisk pobierania jest niedostępny.',
     permCallOffsDownloadHint:

@@ -6,6 +6,9 @@ import {
   resolveSettingsForYear,
   volumeToWeekly,
   resolveOperationVolumeForYear,
+  resolveSourceMachineWeeklyForAllocation,
+  type SourceMachineWeekly,
+  type OperationYearVolumeRow,
   getEffectiveVolumeForPart,
   getEffectiveVolumeForPartPreferContract,
   resolveWeeklyVolumeFromResolved,
@@ -73,10 +76,12 @@ export function resolveTargetCycleOnAllocation(
     oeeForResolve: resolved.oeeForResolve,
   };
 }
-import type { ScenarioBundle } from './scenarioSnapshotService.js';
+import type { ScenarioBundle, ScenarioVolumeEdit } from './scenarioSnapshotService.js';
 import {
   parseScenarioSnapshotJson,
   pushScenarioAudit,
+  scenarioAssignedMachineLabel,
+  scenarioAssignedPartLabel,
   resolveSettingsForScenarioYear,
   scenarioHydratedOperationsForActiveProjects,
   getEffectiveVolumeForPartScenarioPreferContract,
@@ -147,8 +152,7 @@ export function getCandidatesForAllocation(
     ...altMachineIds.map((m) => m.machine_id),
   ]);
 
-  const machine = db.prepare('SELECT location FROM machines WHERE id = ?').get(machineId) as { location: string | null } | undefined;
-  const sourceLocation = machine?.location ?? null;
+  const sourceLocation = sourceMachine.location ?? null;
 
   const buildList = (respectLocation: boolean) => {
     const result: { machine_id: number; internal_number: string | number; type: string; sap_number: string | null; load_percent: number; free_capacity_sec_per_week: number }[] = [];
@@ -157,8 +161,7 @@ export function getCandidatesForAllocation(
       if (!cap || cap.load_percent >= maxLoadPercent) continue;
 
       if (respectLocation && sourceLocation) {
-        const m = db.prepare('SELECT location FROM machines WHERE id = ?').get(id) as { location: string | null } | undefined;
-        if (m?.location != null && m.location !== sourceLocation) continue;
+        if (cap.location != null && String(cap.location) !== String(sourceLocation)) continue;
       }
 
       const freeSec = Math.max(0, cap.availability_sec_per_week - cap.required_sec_per_week);
@@ -444,6 +447,50 @@ export function getAllocationLoadHint(
   return baseHint;
 }
 
+function yearVolumeMapFromRows(rows: any[]): Map<number, OperationYearVolumeRow> {
+  const map = new Map<number, OperationYearVolumeRow>();
+  for (const r of rows) {
+    const id = Number(r.operation_id);
+    if (!Number.isFinite(id)) continue;
+    map.set(id, {
+      volume_value: Number(r.volume_value),
+      volume_unit: String(r.volume_unit || 'annual'),
+      volume_value_before: r.volume_value_before ?? null,
+      effective_from_month: r.effective_from_month ?? null,
+      effective_from_week: r.effective_from_week ?? null,
+      source: r.source ?? null,
+    });
+  }
+  return map;
+}
+
+/**
+ * Zapis przeniesienia. W niepełnym roku displayWeekly jest zagęszczony jak na maszynie,
+ * a do bazy wraca ta sama waga udziału, która tam już leżała.
+ */
+function allocationStoredVolumes(
+  fromMonth: number | null,
+  view: SourceMachineWeekly,
+  currentWeekly: number,
+  moveWeekly: number,
+  fraction: number,
+  moveBaseWeekly: number,
+  volumeToMove: number,
+  volumeUnit: string
+): { remainingBaseWeekly: number; childVolumeValue: number; childVolumeUnit: string } {
+  if (fromMonth == null && view.shareWeightWeekly != null && currentWeekly > 1e-9) {
+    const ratio = view.shareWeightWeekly / currentWeekly;
+    let remainingBaseWeekly = Math.max(0, view.shareWeightWeekly - moveWeekly * ratio);
+    if (remainingBaseWeekly < 1e-6) remainingBaseWeekly = 0;
+    return { remainingBaseWeekly, childVolumeValue: moveWeekly * ratio, childVolumeUnit: 'weekly' };
+  }
+  return {
+    remainingBaseWeekly: fraction > 1e-9 ? (currentWeekly - moveWeekly) / fraction : currentWeekly - moveWeekly,
+    childVolumeValue: volumeUnit === 'weekly' ? moveBaseWeekly : volumeToMove,
+    childVolumeUnit: volumeUnit === 'weekly' ? 'weekly' : volumeUnit,
+  };
+}
+
 /** Execute allocation: move (or split) volume for wybrany rok — ten sam wolumen co w kalkulatorze (nadpisanie per rok > projekt/detal > pole operacji). */
 export function executeAllocation(
   operationId: number,
@@ -474,46 +521,51 @@ export function executeAllocation(
 
   const opYearRow = db
     .prepare(
-      `SELECT volume_value, volume_unit, volume_value_before, effective_from_month, effective_from_week
+      `SELECT volume_value, volume_unit, volume_value_before, effective_from_month, effective_from_week, source
        FROM operation_volume_by_year WHERE operation_id = ? AND year = ?`
     )
-    .get(operationId, year) as
-    | {
-        volume_value: number;
-        volume_unit: string;
-        volume_value_before: number | null;
-        effective_from_month: number | null;
-        effective_from_week: number | null;
-      }
-    | undefined;
+    .get(operationId, year) as OperationYearVolumeRow | undefined;
+
+  let yearRows: any[] = [];
+  try {
+    yearRows = db
+      .prepare(
+        `SELECT operation_id, volume_value, volume_unit, volume_value_before, effective_from_month, effective_from_week, source
+         FROM operation_volume_by_year WHERE year = ?`
+      )
+      .all(year) as any[];
+  } catch {
+    yearRows = db
+      .prepare(`SELECT operation_id, volume_value, volume_unit FROM operation_volume_by_year WHERE year = ?`)
+      .all(year) as any[];
+  }
 
   /**
-   * Stawka tygodniowa do przeniesienia = wolumen „po” ewentualnym wcześniejszym splitcie,
-   * bez ważenia rocznego i bez punktu effectiveFrom z tego requestu (ten punkt zapisujemy osobno).
+   * Sufit przeniesienia = tygodniówka z obciążenia maszyny źródłowej (także niepełny rok).
+   * effectiveFrom z tego żądania nie wchodzi do stawki — zapisujemy go osobno.
    */
-  const resolved = resolveOperationVolumeForYear(
-    {
-      operation_id: operationId,
-      project_id: op.project_id,
-      part_id: op.part_id,
-      volume_value: op.volume_value,
-      volume_unit: op.volume_unit,
-      split_from_operation_id: op.split_from_operation_id ?? null,
-    },
+  const view = resolveSourceMachineWeeklyForAllocation({
+    operationId,
+    projectId: op.project_id ?? null,
+    partId: op.part_id ?? null,
+    volumeValue: op.volume_value,
+    volumeUnit: op.volume_unit,
+    splitFromOperationId: op.split_from_operation_id ?? null,
     year,
-    opYearRow?.effective_from_month != null
-      ? {
-          volume_value: opYearRow.volume_value,
-          volume_unit: opYearRow.volume_unit,
-          volume_value_before: null,
-          effective_from_month: null,
-          effective_from_week: null,
-        }
-      : opYearRow ?? null,
-    null,
+    opYearRow: opYearRow ?? null,
+    scenarioSnapshot: null,
     useContractualVolumes,
-    undefined
-  );
+    settings,
+    sop: op.sop ?? '',
+    eop: op.eop ?? '',
+    volumeMap: yearVolumeMapFromRows(yearRows),
+  });
+  const resolved = {
+    volume_value: view.volumeValue,
+    volume_unit: view.volumeUnit,
+    volume_origin: view.volumeOrigin,
+    count_after_eop: view.countAfterEop,
+  };
 
   const zeroPlaceholder = canAllocateZeroVolumePlaceholder(op.sop, op.eop, year, resolved.volume_value);
 
@@ -521,18 +573,8 @@ export function executeAllocation(
     return { success: false, error: 'Dla wybranego roku wolumen tej operacji wynosi 0.' };
   }
 
-  const weeklyResolved = zeroPlaceholder
-    ? { weekly: 0, fraction: 1 }
-    : resolveWeeklyVolumeFromResolved(resolved.volume_value, resolved.volume_unit, settings, {
-        sop: op.sop ?? '',
-        eop: op.eop ?? '',
-        year,
-        volume_origin: resolved.volume_origin,
-        count_after_eop: resolved.count_after_eop,
-        has_project: op.project_id != null,
-      });
-  const fraction = weeklyResolved.fraction;
-  const currentWeekly = weeklyResolved.weekly;
+  const fraction = zeroPlaceholder ? 1 : view.fraction;
+  const currentWeekly = zeroPlaceholder ? 0 : view.displayWeekly;
   const { moveWeeklyEffective: moveWeekly, moveBaseWeekly } = zeroPlaceholder
     ? { moveWeeklyEffective: 0, moveBaseWeekly: 0 }
     : resolveAllocationMoveWeekly(volumeToMove, volumeUnit, settings, fraction);
@@ -559,11 +601,6 @@ export function executeAllocation(
 
   // Zawsze wykonujemy podział roczny (nawet przy "pełnym" przeniesieniu roku),
   // żeby nie przepinać całej operacji globalnie między maszynami.
-  const remainingWeekly = currentWeekly - moveWeekly;
-  const remainingBaseWeekly = fraction > 1e-9 ? remainingWeekly / fraction : remainingWeekly;
-  const childVolumeValue = volumeUnit === 'weekly' ? moveBaseWeekly : volumeToMove;
-  const childVolumeUnit = volumeUnit === 'weekly' ? 'weekly' : volumeUnit;
-
   const fromMonth =
     effectiveFrom?.month != null && Number.isFinite(Number(effectiveFrom.month))
       ? Math.min(12, Math.max(1, Math.floor(Number(effectiveFrom.month))))
@@ -572,6 +609,19 @@ export function executeAllocation(
     fromMonth != null
       ? Math.min(5, Math.max(1, Math.floor(Number(effectiveFrom?.week) || 1)))
       : null;
+  const stored = allocationStoredVolumes(
+    fromMonth,
+    view,
+    currentWeekly,
+    moveWeekly,
+    fraction,
+    moveBaseWeekly,
+    volumeToMove,
+    volumeUnit
+  );
+  const remainingBaseWeekly = stored.remainingBaseWeekly;
+  const childVolumeValue = stored.childVolumeValue;
+  const childVolumeUnit = stored.childVolumeUnit;
 
   /** Przy alokacji od miesiąca/tygodnia: pełna stawka (bazowa weekly) przed punktem startu. */
   const parentBeforeWeekly =
@@ -736,7 +786,8 @@ export function executeAllocationInScenario(
   actor: string = 'system',
   useContractualVolumes: boolean = false,
   useAlternativeCycleOnTarget: boolean = false,
-  effectiveFrom?: { month: number; week?: number } | null
+  effectiveFrom?: { month: number; week?: number } | null,
+  batchId?: string | null
 ): { success: boolean; error?: string } {
   const row = db.prepare('SELECT snapshot FROM scenarios WHERE id = ?').get(scenarioId) as { snapshot: string } | undefined;
   if (!row) return { success: false, error: 'Scenariusz nie znaleziony' };
@@ -759,40 +810,34 @@ export function executeAllocationInScenario(
 
   const ovRows = bundle.operation_volume_by_year || [];
   const opYearRow = ovRows.find((v: any) => Number(v.operation_id) === operationId && Number(v.year) === year) as
-    | {
-        volume_value: number;
-        volume_unit: string;
-        volume_value_before?: number | null;
-        effective_from_month?: number | null;
-        effective_from_week?: number | null;
-      }
+    | OperationYearVolumeRow
     | undefined;
 
   const settings = resolveSettingsForScenarioYear(year, bundle) ?? resolveSettingsForYear(year);
 
-  const resolved = resolveOperationVolumeForYear(
-    {
-      operation_id: operationId,
-      project_id: op.project_id,
-      part_id: op.part_id,
-      volume_value: op.volume_value,
-      volume_unit: op.volume_unit,
-      split_from_operation_id: op.split_from_operation_id ?? null,
-    },
+  const view = resolveSourceMachineWeeklyForAllocation({
+    operationId,
+    projectId: op.project_id ?? null,
+    partId: op.part_id ?? null,
+    volumeValue: op.volume_value,
+    volumeUnit: op.volume_unit,
+    splitFromOperationId: op.split_from_operation_id ?? null,
     year,
-    opYearRow?.effective_from_month != null
-      ? {
-          volume_value: opYearRow.volume_value,
-          volume_unit: opYearRow.volume_unit,
-          volume_value_before: null,
-          effective_from_month: null,
-          effective_from_week: null,
-        }
-      : opYearRow ?? null,
-    bundle,
+    opYearRow: opYearRow ?? null,
+    scenarioSnapshot: bundle,
     useContractualVolumes,
-    undefined
-  );
+    settings,
+    sop: String(sop),
+    eop: String(eop),
+    volumeMap: yearVolumeMapFromRows(ovRows.filter((v: any) => Number(v.year) === year)),
+    splitOperations: ops,
+  });
+  const resolved = {
+    volume_value: view.volumeValue,
+    volume_unit: view.volumeUnit,
+    volume_origin: view.volumeOrigin,
+    count_after_eop: view.countAfterEop,
+  };
 
   const zeroPlaceholder = canAllocateZeroVolumePlaceholder(sop, eop, year, resolved.volume_value);
 
@@ -800,18 +845,8 @@ export function executeAllocationInScenario(
     return { success: false, error: 'Dla wybranego roku wolumen tej operacji wynosi 0.' };
   }
 
-  const weeklyResolved = zeroPlaceholder
-    ? { weekly: 0, fraction: 1 }
-    : resolveWeeklyVolumeFromResolved(resolved.volume_value, resolved.volume_unit, settings, {
-        sop: String(sop),
-        eop: String(eop),
-        year,
-        volume_origin: resolved.volume_origin,
-        count_after_eop: resolved.count_after_eop,
-        has_project: op.project_id != null,
-      });
-  const fraction = weeklyResolved.fraction;
-  const currentWeekly = weeklyResolved.weekly;
+  const fraction = zeroPlaceholder ? 1 : view.fraction;
+  const currentWeekly = zeroPlaceholder ? 0 : view.displayWeekly;
   const { moveWeeklyEffective: moveWeekly, moveBaseWeekly } = zeroPlaceholder
     ? { moveWeeklyEffective: 0, moveBaseWeekly: 0 }
     : resolveAllocationMoveWeekly(volumeToMove, volumeUnit, settings, fraction);
@@ -836,10 +871,8 @@ export function executeAllocationInScenario(
   const targetNests = targetCycle.nests;
   const targetOeeOverride = targetCycle.oeeForResolve;
 
-  const remainingWeekly = currentWeekly - moveWeekly;
-  const remainingBaseWeekly = fraction > 1e-9 ? remainingWeekly / fraction : remainingWeekly;
-  const childVolumeValue = volumeUnit === 'weekly' ? moveBaseWeekly : volumeToMove;
-  const childVolumeUnit = volumeUnit === 'weekly' ? 'weekly' : volumeUnit;
+  const parentYearBefore = opYearRow ? JSON.parse(JSON.stringify(opYearRow)) : null;
+  const sourceMachineId = Number(op.machine_id);
 
   const fromMonth =
     effectiveFrom?.month != null && Number.isFinite(Number(effectiveFrom.month))
@@ -849,6 +882,19 @@ export function executeAllocationInScenario(
     fromMonth != null
       ? Math.min(5, Math.max(1, Math.floor(Number(effectiveFrom?.week) || 1)))
       : null;
+  const stored = allocationStoredVolumes(
+    fromMonth,
+    view,
+    currentWeekly,
+    moveWeekly,
+    fraction,
+    moveBaseWeekly,
+    volumeToMove,
+    volumeUnit
+  );
+  const remainingBaseWeekly = stored.remainingBaseWeekly;
+  const childVolumeValue = stored.childVolumeValue;
+  const childVolumeUnit = stored.childVolumeUnit;
   const parentBeforeWeekly =
     fromMonth != null
       ? opYearRow?.effective_from_month != null && opYearRow.volume_value_before != null
@@ -892,10 +938,32 @@ export function executeAllocationInScenario(
   }
   ensureSplitChildYearCoverageScenario(bundle, newOpId);
 
+  const moveBatch = String(batchId ?? '').trim() || `move-${newOpId}`;
+  if (!bundle.allocation_moves) bundle.allocation_moves = [];
+  let pack = bundle.allocation_moves.find((m) => m.batchId === moveBatch);
+  if (!pack) {
+    const nextMoveId = bundle.allocation_moves.reduce((max, m) => Math.max(max, Number(m.id) || 0), 0) + 1;
+    pack = { id: nextMoveId, batchId: moveBatch, at: new Date().toISOString(), steps: [] };
+    bundle.allocation_moves.push(pack);
+  }
+  pack.steps.push({
+    sourceOperationId: operationId,
+    childOperationId: newOpId,
+    year,
+    sourceMachineId: Number.isFinite(sourceMachineId) ? sourceMachineId : 0,
+    targetMachineId,
+    partId: op.part_id != null ? Number(op.part_id) : null,
+    parentYearBefore,
+  });
+
+  const partLabel = scenarioAssignedPartLabel(bundle, op.part_id != null ? Number(op.part_id) : null);
+  const sourceLabel = scenarioAssignedMachineLabel(Number(op.machine_id));
+  const targetLabel = scenarioAssignedMachineLabel(targetMachineId);
+  const detailBit = partLabel ? `detalu ${partLabel}` : 'detalu';
   pushScenarioAudit(bundle, {
     author: actor || 'system',
     note_type: 'auto',
-    note: `Automatyczna zmiana: alokacja — część wolumenu operacji #${operationId} przeniesiona na maszynę #${targetMachineId}, utworzono operację #${newOpId}, rok ${year}.`,
+    note: `Automatyczna zmiana: alokacja — część wolumenu ${detailBit} z maszyny ${sourceLabel} przeniesiona na maszynę ${targetLabel}, rok ${year}.`,
     project_id: op.project_id != null ? Number(op.project_id) : null,
     machine_id: targetMachineId,
     part_id: op.part_id != null ? Number(op.part_id) : null,
@@ -910,6 +978,464 @@ export function executeAllocationInScenario(
   saveDb();
   invalidateAllocationSplitIndex();
   return { success: true };
+}
+
+const AUDIT_ALLOC_NOTE = /operacji #(\d+) przeniesiona na maszynę #(\d+), utworzono operację #(\d+), rok (\d+)/;
+
+/** Starsze notatki alokacji (sprzed pakietów) dopisuje jako osobne ruchy, jeśli operacja-dziecko jeszcze jest. */
+export function collectScenarioAllocationMoves(bundle: ScenarioBundle): boolean {
+  if (!bundle.allocation_moves) bundle.allocation_moves = [];
+  const known = new Set(bundle.allocation_moves.flatMap((m) => m.steps.map((s) => s.childOperationId)));
+  let changed = false;
+  const notes = [...(bundle.audit_log || [])].sort((a, b) => Number(a.id) - Number(b.id));
+  for (const n of notes) {
+    const match = AUDIT_ALLOC_NOTE.exec(String(n.note ?? ''));
+    if (!match) continue;
+    const childId = Number(match[3]);
+    if (known.has(childId)) continue;
+    const sourceId = Number(match[1]);
+    const sourceOp = (bundle.operations || []).find((o: any) => Number(o.id) === sourceId);
+    const childExists = (bundle.operations || []).some((o: any) => Number(o.id) === childId);
+    if (!childExists) continue;
+    const nextId = bundle.allocation_moves.reduce((max, row) => Math.max(max, Number(row.id) || 0), 0) + 1;
+    bundle.allocation_moves.push({
+      id: nextId,
+      batchId: `audit-${n.id}`,
+      at: String(n.note_date ?? ''),
+      steps: [
+        {
+          sourceOperationId: sourceId,
+          childOperationId: childId,
+          year: Number(match[4]),
+          sourceMachineId: sourceOp?.machine_id != null ? Number(sourceOp.machine_id) : 0,
+          targetMachineId: Number(match[2]),
+          partId: n.part_id != null ? Number(n.part_id) : sourceOp?.part_id != null ? Number(sourceOp.part_id) : null,
+          parentYearBefore: null,
+        },
+      ],
+    });
+    known.add(childId);
+    changed = true;
+  }
+  if (sortAllocationMovesChronologically(bundle)) changed = true;
+  return changed;
+}
+
+/** Data ruchu. Sama data (YYYY-MM-DD) jest początkiem dnia, więc znacznik z godziną tego samego dnia jest późniejszy. */
+function allocationMoveTime(at: string | undefined): number {
+  const raw = String(at ?? '').trim();
+  if (!raw) return 0;
+  const parsed = Date.parse(raw.length === 10 ? `${raw}T00:00:00.000Z` : raw);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function compareAllocationMoves(
+  a: { at?: string; id?: number },
+  b: { at?: string; id?: number }
+): number {
+  const dt = allocationMoveTime(a.at) - allocationMoveTime(b.at);
+  if (dt !== 0) return dt;
+  return (Number(a.id) || 0) - (Number(b.id) || 0);
+}
+
+/** Najstarszy ruch na początku, najnowszy na końcu — od tego zależy cofanie i drzewo ruchów. */
+function sortAllocationMovesChronologically(bundle: ScenarioBundle): boolean {
+  const moves = bundle.allocation_moves || [];
+  const sorted = [...moves].sort(compareAllocationMoves);
+  const changed = sorted.some((move, index) => move !== moves[index]);
+  if (changed) bundle.allocation_moves = sorted;
+  return changed;
+}
+
+function restoreScenarioParentYear(bundle: ScenarioBundle, step: NonNullable<ScenarioBundle['allocation_moves']>[number]['steps'][number]): void {
+  if (!bundle.operation_volume_by_year) bundle.operation_volume_by_year = [];
+  const rows = bundle.operation_volume_by_year;
+  const idx = rows.findIndex((r: any) => Number(r.operation_id) === step.sourceOperationId && Number(r.year) === step.year);
+  if (step.parentYearBefore) {
+    const restored = { ...step.parentYearBefore, operation_id: step.sourceOperationId, year: step.year };
+    if (idx >= 0) rows[idx] = restored;
+    else rows.push(restored);
+    return;
+  }
+  const child = rows.find((r: any) => Number(r.operation_id) === step.childOperationId && Number(r.year) === step.year);
+  if (!child) return;
+  if (idx >= 0) {
+    rows[idx] = {
+      ...rows[idx],
+      volume_value: Number(rows[idx].volume_value) + Number(child.volume_value || 0),
+    };
+  } else {
+    rows.push({ ...child, operation_id: step.sourceOperationId });
+  }
+}
+
+export type ScenarioMoveListItem = {
+  id: number;
+  at: string;
+  years: number[];
+  partLabel: string;
+  sourceLabel: string;
+  targetLabel: string;
+  canUndo: boolean;
+};
+
+export type ScenarioMoveTreeNode = {
+  title: string;
+  meta: string;
+  children: ScenarioMoveTreeNode[];
+};
+
+type OrderedMoveStep = NonNullable<ScenarioBundle['allocation_moves']>[number]['steps'][number] & { order: number };
+
+function orderedAllocationSteps(bundle: ScenarioBundle): OrderedMoveStep[] {
+  const out: OrderedMoveStep[] = [];
+  let order = 0;
+  for (const move of bundle.allocation_moves || []) {
+    for (const step of move.steps || []) out.push({ ...step, order: order++ });
+  }
+  return out;
+}
+
+function volumeUnitLabel(unit: unknown): string {
+  if (unit === 'monthly') return 'miesięcznie';
+  if (unit === 'weekly') return 'tygodniowo';
+  return 'rocznie';
+}
+
+function operationYearRow(bundle: ScenarioBundle, operationId: number, year: number): { volume_value?: number; volume_unit?: string } | undefined {
+  return (bundle.operation_volume_by_year || []).find(
+    (r: any) => Number(r.operation_id) === operationId && Number(r.year) === year
+  ) as { volume_value?: number; volume_unit?: string } | undefined;
+}
+
+/** Wolumen, który zszedł ze zwalnianej maszyny w tym roku — łącznie z tym, co poszło dalej. */
+function volumeLeftInYear(bundle: ScenarioBundle, steps: OrderedMoveStep[], step: OrderedMoveStep): Map<string, number> {
+  const holders = new Set<number>([step.childOperationId]);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const next of steps) {
+      if (next.year !== step.year) continue;
+      if (holders.has(next.sourceOperationId) && !holders.has(next.childOperationId)) {
+        holders.add(next.childOperationId);
+        grew = true;
+      }
+    }
+  }
+  const passedOn = new Set(
+    steps.filter((row) => row.year === step.year && holders.has(row.sourceOperationId)).map((row) => row.sourceOperationId)
+  );
+  const byUnit = new Map<string, number>();
+  for (const opId of holders) {
+    if (passedOn.has(opId)) continue;
+    const row = operationYearRow(bundle, opId, step.year);
+    const value = Number(row?.volume_value);
+    if (!row || !Number.isFinite(value)) continue;
+    const unit = String(row.volume_unit || 'annual');
+    byUnit.set(unit, (byUnit.get(unit) || 0) + value);
+  }
+  if (byUnit.size > 0) return byUnit;
+  const direct = operationYearRow(bundle, step.childOperationId, step.year);
+  const directValue = Number(direct?.volume_value);
+  if (Number.isFinite(directValue)) return new Map([[String(direct?.volume_unit || 'annual'), directValue]]);
+  const before = Number(step.parentYearBefore?.volume_value);
+  if (Number.isFinite(before)) return new Map([[String(step.parentYearBefore?.volume_unit || 'annual'), before]]);
+  return new Map();
+}
+
+function yearVolumeTitle(bundle: ScenarioBundle, steps: OrderedMoveStep[], yearSteps: OrderedMoveStep[]): string {
+  const year = yearSteps[0].year;
+  const byUnit = new Map<string, number>();
+  for (const step of yearSteps) {
+    for (const [unit, value] of volumeLeftInYear(bundle, steps, step)) {
+      if (!Number.isFinite(value)) continue;
+      byUnit.set(unit, (byUnit.get(unit) || 0) + value);
+    }
+  }
+  const bits = [...byUnit.entries()].map(([unit, value]) => {
+    const rounded = Math.round(value * 1000) / 1000;
+    return `${rounded} ${volumeUnitLabel(unit)}`;
+  });
+  return bits.length > 0 ? `rok ${year} · ${bits.join('; ')}` : `rok ${year}`;
+}
+
+function partYearNodes(bundle: ScenarioBundle, allSteps: OrderedMoveStep[], partSteps: OrderedMoveStep[]): ScenarioMoveTreeNode[] {
+  return groupSteps(partSteps, (step) => String(step.year))
+    .sort((a, b) => a[0].year - b[0].year)
+    .map((yearSteps) => ({
+      title: yearVolumeTitle(bundle, allSteps, yearSteps),
+      meta: '',
+      children: [],
+    }));
+}
+
+function groupSteps(steps: OrderedMoveStep[], key: (step: OrderedMoveStep) => string): OrderedMoveStep[][] {
+  const map = new Map<string, OrderedMoveStep[]>();
+  for (const step of steps) {
+    const k = key(step);
+    const bucket = map.get(k);
+    if (bucket) bucket.push(step);
+    else map.set(k, [step]);
+  }
+  return [...map.values()].sort((a, b) => Math.min(...a.map((s) => s.order)) - Math.min(...b.map((s) => s.order)));
+}
+
+function freedMachineOutline(bundle: ScenarioBundle, steps: OrderedMoveStep[]): ScenarioMoveTreeNode[] {
+  const released = steps.filter((step) => step.sourceMachineId > 0);
+  return groupSteps(released, (step) => String(step.sourceMachineId))
+    .map((machineSteps) => {
+      const machineId = machineSteps[0].sourceMachineId;
+      const parts = groupSteps(machineSteps, (step) => String(step.partId ?? 0))
+        .map((partSteps) => ({
+          title: scenarioAssignedPartLabel(bundle, partSteps[0].partId) || 'detal',
+          meta: '',
+          children: partYearNodes(bundle, steps, partSteps),
+        }))
+        .sort((a, b) => a.title.localeCompare(b.title, 'pl'));
+      return {
+        title: scenarioAssignedMachineLabel(machineId),
+        meta: '',
+        children: parts,
+      };
+    })
+    .filter((node) => node.children.length > 0)
+    .sort((a, b) => a.title.localeCompare(b.title, 'pl'));
+}
+
+function freedPartOutline(bundle: ScenarioBundle, steps: OrderedMoveStep[]): ScenarioMoveTreeNode[] {
+  const released = steps.filter((step) => Number(step.partId) > 0 && step.sourceMachineId > 0);
+  return groupSteps(released, (step) => String(step.partId ?? 0))
+    .map((partSteps) => {
+      const machines = groupSteps(partSteps, (step) => String(step.sourceMachineId))
+        .map((machineSteps) => ({
+          title: scenarioAssignedMachineLabel(machineSteps[0].sourceMachineId),
+          meta: '',
+          children: partYearNodes(bundle, steps, machineSteps),
+        }))
+        .sort((a, b) => a.title.localeCompare(b.title, 'pl'));
+      return {
+        title: scenarioAssignedPartLabel(bundle, partSteps[0].partId) || 'detal',
+        meta: '',
+        children: machines,
+      };
+    })
+    .filter((node) => node.children.length > 0)
+    .sort((a, b) => a.title.localeCompare(b.title, 'pl'));
+}
+
+/** Wszystkie maszyny zwalniane albo wszystkie detale, na jednym widoku. */
+export function buildScenarioAllocationReport(bundle: ScenarioBundle): {
+  machines: ScenarioMoveTreeNode[];
+  parts: ScenarioMoveTreeNode[];
+} {
+  collectScenarioAllocationMoves(bundle);
+  const steps = orderedAllocationSteps(bundle);
+  return { machines: freedMachineOutline(bundle, steps), parts: freedPartOutline(bundle, steps) };
+}
+
+function moveEndpointLabel(bundle: ScenarioBundle, machineIds: number[]): string {
+  const ids = [...new Set(machineIds.filter((id) => Number.isFinite(id) && id > 0))];
+  if (ids.length === 0) return '';
+  if (ids.length === 1) return scenarioAssignedMachineLabel(ids[0]);
+  return ids.map((id) => scenarioAssignedMachineLabel(id)).filter(Boolean).join(', ');
+}
+
+export function listScenarioAllocationMoves(bundle: ScenarioBundle): ScenarioMoveListItem[] {
+  collectScenarioAllocationMoves(bundle);
+  const moves = bundle.allocation_moves || [];
+  const newestId = moves.length > 0 ? moves[moves.length - 1].id : null;
+  return moves.map((move) => {
+    const years = [...new Set(move.steps.map((s) => s.year))].sort((a, b) => a - b);
+    const partIds = [...new Set(move.steps.map((s) => s.partId).filter((id): id is number => id != null && id > 0))];
+    const partLabels = partIds.map((id) => scenarioAssignedPartLabel(bundle, id)).filter(Boolean);
+    const partLabel =
+      partLabels.length <= 1 ? partLabels[0] || '' : partLabels.length <= 3 ? partLabels.join(', ') : `${partLabels.length} detali`;
+    return {
+      id: move.id,
+      at: move.at,
+      years,
+      partLabel,
+      sourceLabel: moveEndpointLabel(bundle, move.steps.map((s) => s.sourceMachineId)),
+      targetLabel: moveEndpointLabel(bundle, move.steps.map((s) => s.targetMachineId)),
+      canUndo: move.id === newestId,
+    };
+  });
+}
+
+export type ScenarioChangeListItem = {
+  kind: 'allocation' | 'volume';
+  id: number;
+  at: string;
+  years: number[];
+  partLabel: string;
+  sourceLabel: string;
+  targetLabel: string;
+  scopeLabel: string;
+  canUndo: boolean;
+};
+
+function volumeEditScopeLabel(edit: { applyProduction: boolean; applyContract: boolean }): string {
+  if (edit.applyProduction && edit.applyContract) return 'produkcyjny i kontraktowy';
+  if (edit.applyContract) return 'kontraktowy';
+  return 'produkcyjny';
+}
+
+function latestVolumeEdit(bundle: ScenarioBundle): ScenarioVolumeEdit | null {
+  const edits = [...(bundle.volume_edits || [])].sort(compareAllocationMoves);
+  return edits.length > 0 ? edits[edits.length - 1] : null;
+}
+
+/** Alokacje i zmiany wolumenu, najnowsze na początku. Cofnięcie tylko dla ostatniego zdarzenia. */
+export function listScenarioChanges(bundle: ScenarioBundle): ScenarioChangeListItem[] {
+  const allocations = listScenarioAllocationMoves(bundle).map((move) => ({
+    kind: 'allocation' as const,
+    id: move.id,
+    at: move.at,
+    years: move.years,
+    partLabel: move.partLabel,
+    sourceLabel: move.sourceLabel,
+    targetLabel: move.targetLabel,
+    scopeLabel: '',
+    canUndo: false,
+  }));
+  const volumes = [...(bundle.volume_edits || [])].sort(compareAllocationMoves).map((edit) => ({
+    kind: 'volume' as const,
+    id: edit.id,
+    at: edit.at,
+    years: [...edit.years].sort((a, b) => a - b),
+    partLabel: scenarioAssignedPartLabel(bundle, edit.partId),
+    sourceLabel: '',
+    targetLabel: '',
+    scopeLabel: volumeEditScopeLabel(edit),
+    canUndo: false,
+  }));
+  const items = [...allocations, ...volumes].sort((a, b) => compareAllocationMoves(b, a));
+  if (items.length > 0) items[0].canUndo = true;
+  return items;
+}
+
+function undoScenarioVolumeEdit(scenarioId: number, actor: string, edit: ScenarioVolumeEdit, bundle: ScenarioBundle): { success: boolean; error?: string; label?: string } {
+  const parts = bundle.parts || [];
+  const part = parts.find((pt: any) => Number(pt.id) === edit.partId) as any;
+  if (!part) return { success: false, error: 'Detal z tej zmiany wolumenu już nie istnieje w scenariuszu.' };
+  part.volume_mode = edit.before.volume_mode || 'project';
+  part.contract_volume_mode = edit.before.contract_volume_mode || 'project';
+  bundle.part_volume_by_year = [
+    ...(bundle.part_volume_by_year || []).filter((r: any) => Number(r.part_id) !== edit.partId),
+    ...(edit.before.part_volume_by_year || []),
+  ];
+  bundle.part_volume_contract_by_year = [
+    ...(bundle.part_volume_contract_by_year || []).filter((r: any) => Number(r.part_id) !== edit.partId),
+    ...(edit.before.part_volume_contract_by_year || []),
+  ];
+  bundle.volume_edits = (bundle.volume_edits || []).filter((row) => row.id !== edit.id);
+  const partLabel = scenarioAssignedPartLabel(bundle, edit.partId);
+  const years = [...edit.years].sort((a, b) => a - b);
+  const detail = partLabel ? `detalu ${partLabel}` : 'detalu';
+  pushScenarioAudit(bundle, {
+    author: actor || 'system',
+    note_type: 'auto',
+    note: `Cofnięto zmianę wolumenu ${volumeEditScopeLabel(edit)} ${detail}, lata ${years.join(', ') || '—'}.`,
+    project_id: edit.projectId,
+    part_id: edit.partId,
+  });
+  try {
+    db.prepare(`UPDATE scenarios SET snapshot = ?, updated_at = datetime('now') WHERE id = ?`).run(JSON.stringify(bundle), scenarioId);
+  } catch {
+    db.prepare('UPDATE scenarios SET snapshot = ? WHERE id = ?').run(JSON.stringify(bundle), scenarioId);
+  }
+  saveDb();
+  return { success: true, label: `wolumen ${volumeEditScopeLabel(edit)} ${detail}, lata ${years.join(', ')}` };
+}
+
+/** Cofa najnowsze zdarzenie: alokację albo zmianę wolumenu. */
+export function undoLastScenarioChange(scenarioId: number, actor: string): { success: boolean; error?: string; label?: string } {
+  const row = db.prepare('SELECT snapshot, archived_at FROM scenarios WHERE id = ?').get(scenarioId) as
+    | { snapshot: string; archived_at: string | null }
+    | undefined;
+  if (!row) return { success: false, error: 'Scenariusz nie znaleziony' };
+  if (row.archived_at != null && String(row.archived_at).trim() !== '') {
+    return { success: false, error: 'Scenariusz zarchiwizowany — cofanie jest wyłączone.' };
+  }
+  let bundle: ScenarioBundle;
+  try {
+    bundle = parseScenarioSnapshotJson(row.snapshot);
+  } catch {
+    return { success: false, error: 'Niepoprawny snapshot scenariusza' };
+  }
+  collectScenarioAllocationMoves(bundle);
+  const alloc = (bundle.allocation_moves || []).slice().sort(compareAllocationMoves).pop() ?? null;
+  const volume = latestVolumeEdit(bundle);
+  if (!alloc && !volume) return { success: false, error: 'Brak ruchów do cofnięcia.' };
+  const volumeIsNewer = volume != null && (alloc == null || compareAllocationMoves(alloc, volume) < 0);
+  if (!volumeIsNewer) return undoLastScenarioAllocationMove(scenarioId, actor);
+  return undoScenarioVolumeEdit(scenarioId, actor, volume as ScenarioVolumeEdit, bundle);
+}
+
+/** Cofa najnowszy pakiet alokacji w scenariuszu. Starsze pakiety dopiero po cofnięciu nowszych. */
+export function undoLastScenarioAllocationMove(
+  scenarioId: number,
+  actor: string
+): { success: boolean; error?: string; label?: string } {
+  const row = db.prepare('SELECT snapshot, archived_at FROM scenarios WHERE id = ?').get(scenarioId) as
+    | { snapshot: string; archived_at: string | null }
+    | undefined;
+  if (!row) return { success: false, error: 'Scenariusz nie znaleziony' };
+  if (row.archived_at != null && String(row.archived_at).trim() !== '') {
+    return { success: false, error: 'Scenariusz zarchiwizowany — cofanie jest wyłączone.' };
+  }
+  let bundle: ScenarioBundle;
+  try {
+    bundle = parseScenarioSnapshotJson(row.snapshot);
+  } catch {
+    return { success: false, error: 'Niepoprawny snapshot scenariusza' };
+  }
+  collectScenarioAllocationMoves(bundle);
+  const moves = [...(bundle.allocation_moves || [])].sort(compareAllocationMoves);
+  if (moves.length === 0) return { success: false, error: 'Brak ruchów do cofnięcia.' };
+  const move = moves[moves.length - 1];
+  const ops = bundle.operations || [];
+  for (const step of move.steps) {
+    const further = ops.some((o: any) => Number(o.split_from_operation_id) === step.childOperationId);
+    if (further) {
+      return { success: false, error: 'Ten ruch ma późniejsze alokacje wychodzące z utworzonej operacji. Cofnij je najpierw.' };
+    }
+  }
+  for (let i = move.steps.length - 1; i >= 0; i--) {
+    const step = move.steps[i];
+    restoreScenarioParentYear(bundle, step);
+    bundle.operation_volume_by_year = (bundle.operation_volume_by_year || []).filter(
+      (r: any) => Number(r.operation_id) !== step.childOperationId
+    );
+    bundle.operations = (bundle.operations || []).filter((o: any) => Number(o.id) !== step.childOperationId);
+  }
+  bundle.allocation_moves = moves.filter((row) => row.id !== move.id);
+  const years = [...new Set(move.steps.map((s) => s.year))].sort((a, b) => a - b);
+  const step = move.steps[0];
+  const partIds = [...new Set(move.steps.map((s) => s.partId).filter((id): id is number => id != null && id > 0))];
+  const partLabels = partIds.map((id) => scenarioAssignedPartLabel(bundle, id)).filter(Boolean);
+  const partLabel =
+    partLabels.length <= 1 ? partLabels[0] || '' : partLabels.length <= 3 ? partLabels.join(', ') : `${partLabels.length} detali`;
+  const source = moveEndpointLabel(bundle, move.steps.map((s) => s.sourceMachineId));
+  const target = moveEndpointLabel(bundle, move.steps.map((s) => s.targetMachineId));
+  const detail = partLabel ? `detalu ${partLabel}` : 'detalu';
+  pushScenarioAudit(bundle, {
+    author: actor || 'system',
+    note_type: 'auto',
+    note: `Cofnięto alokację ${detail} z maszyny ${target} z powrotem na maszynę ${source}, lata ${years.join(', ')}.`,
+    project_id: null,
+    machine_id: step?.sourceMachineId || null,
+    part_id: step?.partId ?? null,
+    operation_id: step?.sourceOperationId ?? null,
+  });
+  try {
+    db.prepare(`UPDATE scenarios SET snapshot = ?, updated_at = datetime('now') WHERE id = ?`).run(JSON.stringify(bundle), scenarioId);
+  } catch {
+    db.prepare('UPDATE scenarios SET snapshot = ? WHERE id = ?').run(JSON.stringify(bundle), scenarioId);
+  }
+  saveDb();
+  invalidateAllocationSplitIndex();
+  return { success: true, label: `${detail}: ${target} → ${source}, lata ${years.join(', ')}` };
 }
 
 /**
@@ -1238,6 +1764,49 @@ export function forwardVolumeBlockForMachine(machineId: number, now = new Date()
         year,
         null,
         null,
+        false
+      );
+      if (Number(resolved.volume_value) > VOLUME_EPS) years.add(year);
+    }
+  }
+  return { blocked: years.size > 0, years: [...years].sort((a, b) => a - b) };
+}
+
+/** To samo co produkcja, ale wolumen i SOP/EOP biorą się ze snapshotu scenariusza. */
+export function forwardVolumeBlockForMachineInScenario(
+  bundle: ScenarioBundle,
+  machineId: number,
+  now = new Date()
+): { blocked: boolean; years: number[] } {
+  const today = todayVolumePoint(now);
+  const ops = (bundle.operations || []).filter(
+    (o: any) => Number(o.machine_id) === machineId && String(o.status ?? 'active') === 'active'
+  );
+  const years = new Set<number>();
+  for (const op of ops) {
+    const rows = (bundle.operation_volume_by_year || []).filter((r: any) => Number(r.operation_id) === Number(op.id));
+    const coveredYears = new Set<number>();
+    if (rows.length > 0) {
+      for (const row of rows) {
+        coveredYears.add(Number(row.year));
+        if (yearRowHasForwardVolume(row, now)) years.add(Number(row.year));
+      }
+    }
+    if (op.split_from_operation_id != null) continue;
+    for (const year of productionYearsFromToday(op.sop, op.eop, today)) {
+      if (coveredYears.has(year)) continue;
+      const resolved = resolveOperationVolumeForYear(
+        {
+          operation_id: Number(op.id),
+          project_id: op.project_id,
+          part_id: op.part_id,
+          volume_value: Number(op.volume_value) || 0,
+          volume_unit: op.volume_unit || 'annual',
+          split_from_operation_id: null,
+        },
+        year,
+        null,
+        bundle,
         false
       );
       if (Number(resolved.volume_value) > VOLUME_EPS) years.add(year);

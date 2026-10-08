@@ -1,0 +1,1 @@
+ALTER TABLE scenarios ADD COLUMN is_confidential INTEGER NOT NULL DEFAULT 0;

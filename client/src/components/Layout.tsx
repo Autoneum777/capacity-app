@@ -363,7 +363,7 @@ export default function Layout({ children }: { children: ReactNode }) {
     }
   }, [appSection, activeScenarioId, location.pathname, location.search, navigate]);
 
-  /** W obszarze scenariuszy dostępne są tylko kalkulator, historia i lista scenariuszy — inne ścieżki przekieruj. */
+  /** W obszarze scenariuszy: kalkulator, maszyny (linia tylko w scenariuszu), historia i lista scenariuszy. */
   useEffect(() => {
     if (appSection !== 'scenarios') return;
     const p = location.pathname;
@@ -374,7 +374,9 @@ export default function Layout({ children }: { children: ReactNode }) {
       p === '/administracja/instrukcja' ||
       p === '/historia-zmian' ||
       p === '/scenariusze' ||
-      p.startsWith('/scenariusze/');
+      p.startsWith('/scenariusze/') ||
+      p === '/maszyny' ||
+      p.startsWith('/maszyny/');
     if (allowed) return;
     const sp = new URLSearchParams();
     if (activeScenarioId != null && activeScenarioId > 0) sp.set('scenarioId', String(activeScenarioId));
@@ -484,6 +486,7 @@ export default function Layout({ children }: { children: ReactNode }) {
 
   const scenarioMainNav: { path: string; labelKey: string; end?: boolean; permission: string; isActivePath?: (pathname: string) => boolean }[] = [
     { path: '/kalkulator', labelKey: 'layout.calculator', end: true, permission: 'calculator.view' },
+    { path: '/maszyny', labelKey: 'layout.machines', permission: 'machines.view' },
   ];
 
   const callOffMainNav: { path: string; labelKey: string; end?: boolean; permission: string; isActivePath?: (pathname: string) => boolean }[] = [

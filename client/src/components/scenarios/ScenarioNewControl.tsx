@@ -2,6 +2,7 @@ import { useEffect, useState, type CSSProperties } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../../api/client';
 import SearchableSelect from '../SearchableSelect';
+import { useAuth } from '../../context/AuthContext';
 import { useI18n } from '../../context/I18nContext';
 import { useScenarioMode } from '../../context/ScenarioModeContext';
 import { DEFAULT_WORKSPACE_THEMES, workspaceThemesFromVisualSettings } from '../../utils/workspaceTheme';
@@ -29,6 +30,8 @@ type Props = {
 
 export default function ScenarioNewControl({ buttonStyle, className, onCreated, activateOnCreate = false }: Props) {
   const { t } = useI18n();
+  const { hasPermission } = useAuth();
+  const canConfidential = hasPermission('scenarios.view_confidential');
   const navigate = useNavigate();
   const { setActiveScenario } = useScenarioMode();
 
@@ -38,6 +41,7 @@ export default function ScenarioNewControl({ buttonStyle, className, onCreated, 
   const [baseMode, setBaseMode] = useState<'live' | 'scenario'>('live');
   const [sourceScenarioId, setSourceScenarioId] = useState<number | ''>('');
   const [useCallOffVolumes, setUseCallOffVolumes] = useState(false);
+  const [confidential, setConfidential] = useState(false);
   const [sourceCallOffId, setSourceCallOffId] = useState<number | ''>('');
   const [activeForSourcePicker, setActiveForSourcePicker] = useState<ScenarioRow[]>([]);
   const [callOffComparisons, setCallOffComparisons] = useState<CallOffRow[]>([]);
@@ -71,6 +75,7 @@ export default function ScenarioNewControl({ buttonStyle, className, onCreated, 
     setBaseMode('live');
     setSourceScenarioId('');
     setUseCallOffVolumes(false);
+    setConfidential(false);
     setSourceCallOffId('');
     setOpen(true);
   };
@@ -114,6 +119,7 @@ export default function ScenarioNewControl({ buttonStyle, className, onCreated, 
         scenario_scope,
         sourceScenarioId: baseMode === 'scenario' && sourceScenarioId !== '' ? Number(sourceScenarioId) : null,
         sourceCallOffComparisonId: useCallOffVolumes && sourceCallOffId !== '' ? Number(sourceCallOffId) : null,
+        confidential: canConfidential && confidential,
       })
       .then((row) => {
         closeModal();
@@ -242,6 +248,19 @@ export default function ScenarioNewControl({ buttonStyle, className, onCreated, 
                 style={{ width: '100%', padding: 6, marginTop: 4 }}
                 placeholder={t('scenarios.namePlaceholder')}
               />
+            </label>
+            <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 4, cursor: canConfidential ? 'pointer' : 'default' }}>
+              <input
+                type="checkbox"
+                checked={canConfidential && confidential}
+                disabled={!canConfidential}
+                onChange={(e) => setConfidential(e.target.checked)}
+                style={{ marginTop: 3 }}
+              />
+              <span>
+                <strong>confidential</strong>
+                <span style={{ display: 'block', fontSize: 13, color: '#666', fontWeight: 400 }}>{t('scenarios.confidentialHint')}</span>
+              </span>
             </label>
             <label style={{ display: 'block', marginBottom: 12 }}>
               {t('scenarios.scopeRequired')}{' '}

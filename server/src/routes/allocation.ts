@@ -9,8 +9,10 @@ import {
 } from '../services/allocationService.js';
 import { parseScenarioSnapshotJson } from '../services/scenarioSnapshotService.js';
 import { resolveActor } from '../utils/authActor.js';
+import { blockHiddenScenarioAccess } from '../auth/scenarioVisibility.js';
 
 export const allocationRouter = Router();
+allocationRouter.use(blockHiddenScenarioAccess);
 
 function loadScenarioBundleForAllocation(scenarioId: number): { bundle: ReturnType<typeof parseScenarioSnapshotJson>; includeRfq: boolean } | null {
   const row = db.prepare('SELECT snapshot, archived_at FROM scenarios WHERE id = ?').get(scenarioId) as
@@ -95,6 +97,7 @@ allocationRouter.post('/execute', (req, res) => {
     useContractualVolumes: useCvBody,
     effectiveFromMonth,
     effectiveFromWeek,
+    batchId,
   } = req.body as any;
   const useContractualVolumes =
     useCvBody === true ||
@@ -139,7 +142,8 @@ allocationRouter.post('/execute', (req, res) => {
       resolveActor(req),
       useContractualVolumes,
       useAlternativeCycleOnTarget,
-      effectiveFrom
+      effectiveFrom,
+      batchId != null ? String(batchId) : null
     );
     if (!result.success) return res.status(400).json({ ...result, error: result.error });
     return res.json(result);

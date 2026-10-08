@@ -18,6 +18,7 @@ type ScenarioRow = {
   source_call_off_name?: string | null;
   updated_at?: string | null;
   archived_at?: string | null;
+  is_confidential?: boolean | number;
 };
 
 /** Jednakowa szerokość przycisków w kolumnie akcji (Aktywne i Archiwum). */
@@ -190,7 +191,14 @@ export default function Scenarios() {
         <tbody>
           {filteredList.map((s) => (
             <tr key={s.id}>
-              <td style={{ padding: '0.75rem' }}>{s.name}</td>
+              <td style={{ padding: '0.75rem' }}>
+                {s.name}
+                {Number(s.is_confidential) === 1 ? (
+                  <span style={{ marginLeft: 8, fontSize: 11, fontWeight: 700, letterSpacing: 0.3, color: '#6a1b9a', background: '#f3e5f5', borderRadius: 4, padding: '1px 6px' }}>
+                    confidential
+                  </span>
+                ) : null}
+              </td>
               <td style={{ padding: '0.75rem', fontSize: 13, color: '#555', maxWidth: 320, verticalAlign: 'top' }}>
                 {s.scenario_scope && s.scenario_scope.trim()
                   ? s.scenario_scope.trim().length > 140

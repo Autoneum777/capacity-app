@@ -30,8 +30,10 @@ import {
   sqlInClause,
 } from '../utils/queryListParams.js';
 import { normalizeClientName, parseClientFilterQuery } from '../utils/clientName.js';
+import { blockHiddenScenarioAccess } from '../auth/scenarioVisibility.js';
 
 export const capacityRouter = Router();
+capacityRouter.use(blockHiddenScenarioAccess);
 
 function parseUseContractualVolumes(v: unknown): boolean {
   return v === '1' || String(v ?? '').toLowerCase() === 'true';

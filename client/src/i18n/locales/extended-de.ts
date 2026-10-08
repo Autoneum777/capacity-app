@@ -1400,6 +1400,7 @@ export const extendedDe: TranslationTree = {
     permDelete: 'Löschen',
     permDownload: 'Herunterladen',
     permCreateRfq: 'RFQ erstellen',
+    permViewConfidential: 'Vertraulich',
     permCalculator: 'Rechner',
     permMachines: 'Maschinen',
     permProjects: 'Projekte',
@@ -1416,6 +1417,8 @@ export const extendedDe: TranslationTree = {
     permRoleManagement: 'Rollenverwaltung',
     permCreateRfqHint:
       'RFQ erstellen: Der Benutzer darf nur Projekte mit Status RFQ anlegen und Teile, Operationen sowie Volumen in solchen Projekten bearbeiten.',
+    permConfidentialHint:
+      'Szenarien → Vertraulich: Anzeigen, Bearbeiten und Rechnen von als confidential markierten Szenarien. Ohne diese Berechtigung bleiben sie unsichtbar.',
     permAttachmentsDownloadHint:
       'Anhänge: Ansicht = Admin-Inventar. Herunterladen = Projektdateien herunterladen. Deaktivieren der Ansicht deaktiviert auch Herunterladen. Ohne Herunterladen ist der Download nicht verfügbar.',
     permCallOffsDownloadHint:

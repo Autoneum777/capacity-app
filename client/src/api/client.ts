@@ -155,6 +155,12 @@ function getVisualSettingsCached(): Promise<VisualSettings> {
   return visualSettingsInFlight;
 }
 
+export type AllocationTreeNode = {
+  title: string;
+  meta: string;
+  children: AllocationTreeNode[];
+};
+
 export const api = {
   auth: {
     login: (body: { login: string; password: string }) =>
@@ -908,17 +914,20 @@ export const api = {
     },
   },
   machines: {
-    list: (params?: { status?: string; statuses?: string; type?: string; types?: string; search?: string }) => {
+    list: (params?: { status?: string; statuses?: string; type?: string; types?: string; search?: string; scenarioId?: number }) => {
       const q = toQuery(params || {});
       return request<any[]>(`/machines${q}`);
     },
     types: () => request<string[]>('/machines/types'),
-    get: (id: number) => request<any>(`/machines/${id}`),
+    get: (id: number, params?: { scenarioId?: number }) => {
+      const q = toQuery(params || {});
+      return request<any>(`/machines/${id}${q}`);
+    },
     activeProjectOperationCount: (id: number) =>
       request<{ count: number; projects: { id: number; client: string; name: string }[] }>(
         `/machines/${id}/active-project-operation-count`
       ),
-    operations: (id: number, params?: { year?: number; scenarioId?: number; useContractualVolumes?: boolean }) => {
+    operations: (id: number, params?: { year?: number; scenarioId?: number; useContractualVolumes?: boolean; includeVolumeYears?: boolean }) => {
       const q = toQuery(params || {});
       return request<any[]>(`/machines/${id}/operations${q}`);
     },
@@ -1517,6 +1526,8 @@ export const api = {
       useContractualVolumes?: boolean;
       effectiveFromMonth?: number;
       effectiveFromWeek?: number;
+      /** Wspólny identyfikator jednego kliknięcia (wiele lat = jeden pakiet do cofnięcia). */
+      batchId?: string;
     }) => request<any>('/allocation/execute', { method: 'POST', body: JSON.stringify(body) }),
   },
   scenarios: {
@@ -1533,6 +1544,7 @@ export const api = {
           source_call_off_name?: string | null;
           updated_at?: string | null;
           archived_at?: string | null;
+          is_confidential?: boolean | number;
         }[]
       >(`/scenarios${params?.archived ? '?archived=1' : ''}`),
     get: (id: number) =>
@@ -1545,6 +1557,7 @@ export const api = {
         source_scenario_id?: number | null;
         source_call_off_comparison_id?: number | null;
         archived_at?: string | null;
+        is_confidential?: boolean | number;
         snapshot: any;
       }>(`/scenarios/${id}`),
     create: (body: {
@@ -1552,6 +1565,7 @@ export const api = {
       scenario_scope: string;
       sourceScenarioId?: number | null;
       sourceCallOffComparisonId?: number | null;
+      confidential?: boolean;
     }) =>
       request<{
         id: number;
@@ -1622,13 +1636,20 @@ export const api = {
       scenarioId: number,
       partId: number,
       body:
-        | { mode: 'override'; volumes: { year: number; volume_value: number; volume_unit: 'annual' | 'monthly' | 'weekly' }[] }
-        | { mode: 'project' }
+        | {
+            mode: 'override';
+            volumes: { year: number; volume_value: number; volume_unit: 'annual' | 'monthly' | 'weekly' }[];
+            applyProduction?: boolean;
+            applyContract?: boolean;
+          }
+        | { mode: 'project'; applyProduction?: boolean; applyContract?: boolean }
     ) =>
       request<{
         id: number;
         volume_mode: string;
+        contract_volume_mode?: string;
         volumes: { part_id: number; year: number; volume_value: number; volume_unit: string; volume_origin?: string }[];
+        contract_volumes?: { part_id: number; year: number; volume_value: number; volume_unit: string; volume_origin?: string }[];
         unchanged?: boolean;
       }>(`/scenarios/${scenarioId}/parts/${partId}/volumes`, {
         method: 'PUT',
@@ -1644,6 +1665,38 @@ export const api = {
         method: 'PATCH',
         body: JSON.stringify(body),
       }),
+    /** Nr linii maszyny — tylko w scenariuszu, bez wpływu na produkcję. */
+    patchMachineLocation: (scenarioId: number, machineId: number, body: { location: string | null }) =>
+      request<{ id: number; location: string | null; unchanged?: boolean }>(
+        `/scenarios/${scenarioId}/machines/${machineId}/location`,
+        { method: 'PATCH', body: JSON.stringify(body) }
+      ),
+    patchMachineStatus: (scenarioId: number, machineId: number, body: { status: 'active' | 'inactive' | 'RFQ' }) =>
+      request<{ id: number; status: 'active' | 'inactive' | 'RFQ'; unchanged?: boolean }>(
+        `/scenarios/${scenarioId}/machines/${machineId}/status`,
+        { method: 'PATCH', body: JSON.stringify(body) }
+      ),
+    allocationReport: (scenarioId: number) =>
+      request<{
+        machines: AllocationTreeNode[];
+        parts: AllocationTreeNode[];
+      }>(`/scenarios/${scenarioId}/allocation-report`),
+    allocationMoves: (scenarioId: number) =>
+      request<
+        {
+          kind?: 'allocation' | 'volume';
+          id: number;
+          at: string;
+          years: number[];
+          partLabel: string;
+          sourceLabel: string;
+          targetLabel: string;
+          scopeLabel?: string;
+          canUndo: boolean;
+        }[]
+      >(`/scenarios/${scenarioId}/allocation-moves`),
+    undoAllocationMove: (scenarioId: number) =>
+      request<{ ok: boolean; label?: string }>(`/scenarios/${scenarioId}/allocation-moves/undo`, { method: 'POST' }),
     addableProjects: (scenarioId: number) =>
       request<{ id: number; client: string; name: string; sop: string | null; eop: string | null; status: string }[]>(
         `/scenarios/${scenarioId}/addable-projects`

@@ -101,6 +101,10 @@ export default function Machines() {
   const canViewDetails = hasAnyPermission(['machines.details', 'machines.edit']);
   const location = useLocation();
   const scenarioQs = location.search || '';
+  const scenarioId = useMemo(() => {
+    const n = Number(new URLSearchParams(location.search).get('scenarioId'));
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }, [location.search]);
   const [list, setList] = useState<any[]>([]);
   const [types, setTypes] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
@@ -173,7 +177,7 @@ export default function Machines() {
     if (types) params.types = types;
     if (search.trim()) params.search = search.trim();
     api.machines
-      .list(params)
+      .list({ ...params, ...(scenarioId != null ? { scenarioId } : {}) })
       .then((data) => {
         setList(Array.isArray(data) ? data : []);
       })
@@ -187,7 +191,7 @@ export default function Machines() {
   useEffect(() => {
     api.settings.machineTypes.list().then(setMachineCatalog).catch(() => setMachineCatalog([]));
   }, []);
-  useEffect(load, [toolbarStatusFilter.join(','), typeFilter.join(','), search]);
+  useEffect(load, [toolbarStatusFilter.join(','), typeFilter.join(','), search, scenarioId]);
 
   const openAdd = () => {
     api.settings.machineTypes.list().then(setMachineCatalog).catch(() => setMachineCatalog([]));
@@ -309,7 +313,8 @@ export default function Machines() {
     }
     setSavingLineId(m.id);
     try {
-      await api.machines.update(m.id, { location: stored });
+      if (scenarioId != null) await api.scenarios.patchMachineLocation(scenarioId, m.id, { location: stored });
+      else await api.machines.update(m.id, { location: stored });
       setList((prev) => prev.map((x) => (x.id === m.id ? { ...x, location: stored } : x)));
       setLineEdits((prev) => {
         const next = { ...prev };
@@ -325,8 +330,11 @@ export default function Machines() {
 
   const completeRowStatusChange = (machineId: number, next: MachineFormStatus) => {
     setSavingStatusId(machineId);
-    api.machines
-      .update(machineId, { status: next })
+    const write =
+      scenarioId != null
+        ? api.scenarios.patchMachineStatus(scenarioId, machineId, { status: next })
+        : api.machines.update(machineId, { status: next });
+    write
       .then(() => load())
       .catch((err: Error) => alert(err?.message || 'Błąd zapisu statusu'))
       .finally(() => setSavingStatusId(null));
@@ -334,7 +342,7 @@ export default function Machines() {
 
   const handleRowStatusChange = async (machineId: number, current: string | undefined, next: MachineFormStatus) => {
     if (current === next) return;
-    if (next === 'inactive' || next === 'RFQ') {
+    if (scenarioId == null && (next === 'inactive' || next === 'RFQ')) {
       try {
         const data = await api.machines.activeProjectOperationCount(machineId);
         if (data.count > 0) {
@@ -363,10 +371,14 @@ export default function Machines() {
         </p>
       )}
       <div className="filters-toolbar">
-        <button onClick={openAdd} style={{ padding: '0.5rem 1rem', background: 'var(--cap-green)', color: 'white', border: 'none', borderRadius: 4 }}>{t('machines.add')}</button>
-        <div style={{ position: 'relative' }}>
-          <button onClick={openImport} style={{ padding: '0.5rem 1rem', background: '#1976d2', color: 'white', border: 'none', borderRadius: 4 }}>{t('common.import')}</button>
-        </div>
+        {scenarioId == null && (
+          <>
+            <button onClick={openAdd} style={{ padding: '0.5rem 1rem', background: 'var(--cap-green)', color: 'white', border: 'none', borderRadius: 4 }}>{t('machines.add')}</button>
+            <div style={{ position: 'relative' }}>
+              <button onClick={openImport} style={{ padding: '0.5rem 1rem', background: '#1976d2', color: 'white', border: 'none', borderRadius: 4 }}>{t('common.import')}</button>
+            </div>
+          </>
+        )}
         <span className="filters-label">{t('machines.machineStatus')}</span>
         <div style={{ minWidth: 200, maxWidth: 280, alignSelf: 'center' }}>
           <StatusMultiFilter selected={toolbarStatusFilter} onChange={setToolbarStatusFilter} />
@@ -377,13 +389,15 @@ export default function Machines() {
         </div>
         <input type="text" placeholder={t('machines.searchPlaceholder')} value={search} onChange={(e) => setSearch(e.target.value)} style={{ minWidth: 200 }} />
         <button type="button" className="filter-clear-btn" onClick={clearAllFilters}>{t('common.clearFilters')}</button>
-        <button
-          type="button"
-          onClick={() => setGroupsModal(true)}
-          style={{ marginLeft: 'auto', padding: '0.5rem 1rem', background: '#5c6bc0', color: 'white', border: 'none', borderRadius: 4, flexShrink: 0 }}
-        >
-          {t('machines.groupsBtn')}
-        </button>
+        {scenarioId == null && (
+          <button
+            type="button"
+            onClick={() => setGroupsModal(true)}
+            style={{ marginLeft: 'auto', padding: '0.5rem 1rem', background: '#5c6bc0', color: 'white', border: 'none', borderRadius: 4, flexShrink: 0 }}
+          >
+            {t('machines.groupsBtn')}
+          </button>
+        )}
       </div>
       <table style={{ width: '100%', borderCollapse: 'collapse', background: 'white', boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }}>
         <thead>

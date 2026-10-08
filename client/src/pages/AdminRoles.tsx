@@ -21,7 +21,7 @@ import { useAuth } from '../context/AuthContext';
 import { useI18n } from '../context/I18nContext';
 import { useTableSort, sortRows } from '../utils/tableSort';
 
-type PermAction = 'view' | 'details' | 'change_status' | 'edit' | 'delete' | 'download' | 'create_rfq';
+type PermAction = 'view' | 'details' | 'change_status' | 'edit' | 'delete' | 'download' | 'create_rfq' | 'view_confidential';
 
 const PERMISSION_RESOURCES: { key: string; labelKey: string; actions: PermAction[] }[] = [
   { key: 'calculator', labelKey: 'auth.permCalculator', actions: ['view', 'download'] },
@@ -32,7 +32,7 @@ const PERMISSION_RESOURCES: { key: string; labelKey: string; actions: PermAction
     actions: ['view', 'details', 'change_status', 'edit', 'delete', 'create_rfq'],
   },
   { key: 'designations', labelKey: 'auth.permDesignations', actions: ['view', 'edit', 'delete', 'download'] },
-  { key: 'scenarios', labelKey: 'auth.permScenarios', actions: ['view', 'edit', 'delete', 'download'] },
+  { key: 'scenarios', labelKey: 'auth.permScenarios', actions: ['view', 'edit', 'delete', 'download', 'view_confidential'] },
   { key: 'call_offs', labelKey: 'auth.permCallOffs', actions: ['view', 'edit', 'delete', 'download'] },
   { key: 'admin_database', labelKey: 'auth.permAdminDatabase', actions: ['view', 'edit', 'download'] },
   { key: 'admin_settings', labelKey: 'auth.permAdminSettings', actions: ['view', 'edit', 'download'] },
@@ -52,6 +52,7 @@ const ACTION_COLUMNS: PermAction[] = [
   'delete',
   'download',
   'create_rfq',
+  'view_confidential',
 ];
 
 export function PermissionMatrix({
@@ -84,6 +85,7 @@ export function PermissionMatrix({
     if (action === 'edit') return t('auth.permEdit');
     if (action === 'delete') return t('auth.permDelete');
     if (action === 'create_rfq') return t('auth.permCreateRfq');
+    if (action === 'view_confidential') return t('auth.permViewConfidential');
     return t('auth.permDownload');
   };
   return (
@@ -121,6 +123,7 @@ export function PermissionMatrix({
         </tbody>
       </table>
       <p style={{ margin: '8px 0 0', fontSize: 12, color: '#666', lineHeight: 1.45 }}>{t('auth.permCreateRfqHint')}</p>
+      <p style={{ margin: '4px 0 0', fontSize: 12, color: '#666', lineHeight: 1.45 }}>{t('auth.permConfidentialHint')}</p>
       <p style={{ margin: '4px 0 0', fontSize: 12, color: '#666', lineHeight: 1.45 }}>{t('auth.permAttachmentsDownloadHint')}</p>
       <p style={{ margin: '4px 0 0', fontSize: 12, color: '#666', lineHeight: 1.45 }}>{t('auth.permCallOffsDownloadHint')}</p>
     </div>

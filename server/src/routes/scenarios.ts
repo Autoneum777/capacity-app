@@ -2,6 +2,7 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import os from 'os';
 import { Router } from 'express';
 import { db, saveDb } from '../db/connection.js';
+import { normalizeMachineLineLocationOptional } from '../utils/machineLineLocation.js';
 import { formatDetailSapAliasLabel } from '../utils/detailLabel.js';
 import { loadReferenceDisplayMode } from '../utils/referenceDisplayMode.js';
 import { parseCsvQueryParamSingleOrMulti, parseIdList } from '../utils/queryListParams.js';
@@ -13,10 +14,32 @@ import {
   exportLiveScenarioBundle,
   parseScenarioSnapshotJson,
   pushScenarioAudit,
+  humanizeScenarioHistoryNote,
+  scenarioAssignedPartLabel,
+  ensureScenarioMachineLocations,
+  ensureScenarioMachineStatuses,
+  normalizeScenarioLineStatus,
   listProductionProjectsNotInBundle,
   appendProductionProjectsToBundle,
 } from '../services/scenarioSnapshotService.js';
+import {
+  collectScenarioAllocationMoves,
+  buildScenarioAllocationReport,
+  forwardVolumeBlockForMachineInScenario,
+  listScenarioChanges,
+  undoLastScenarioChange,
+} from '../services/allocationService.js';
+import { canViewConfidentialScenarios, isScenarioHiddenFromRequest } from '../auth/scenarioVisibility.js';
 export const scenariosRouter = Router();
+
+scenariosRouter.use('/:id', (req, res, next) => {
+  const id = Number(req.params.id);
+  if (isScenarioHiddenFromRequest(req, id)) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  next();
+});
 
 const DEPLOY_CHALLENGE_TTL_MS = 10 * 60 * 1000;
 
@@ -82,11 +105,15 @@ scenariosRouter.get('/', (req, res) => {
   const wantArchived = archivedParam === '1' || archivedParam === 'true';
   const activeClause = wantArchived ? 's.archived_at IS NOT NULL' : 's.archived_at IS NULL';
 
+  const allowConfidential = canViewConfidentialScenarios(req);
+  const hideConfidential = (rows: any[]) =>
+    allowConfidential ? rows : rows.filter((r) => Number(r.is_confidential) !== 1);
+
   try {
     const list = db
       .prepare(
         `SELECT s.id, s.name, s.created_at, s.source_scenario_id, s.updated_at, s.scenario_scope, s.archived_at,
-                s.source_call_off_comparison_id,
+                s.source_call_off_comparison_id, s.is_confidential,
                 ps.name AS source_scenario_name,
                 co.name AS source_call_off_name
          FROM scenarios s
@@ -96,7 +123,7 @@ scenariosRouter.get('/', (req, res) => {
          ORDER BY ${wantArchived ? 's.archived_at DESC, s.created_at DESC' : 's.created_at DESC'}`
       )
       .all() as any[];
-    res.json(list);
+    res.json(hideConfidential(list));
   } catch {
     try {
       const list = db
@@ -108,10 +135,10 @@ scenariosRouter.get('/', (req, res) => {
            ORDER BY s.created_at DESC`
         )
         .all() as any[];
-      res.json(list.map((r) => ({ ...r, scenario_scope: (r as any).scenario_scope ?? '', archived_at: null })));
+      res.json(hideConfidential(list).map((r) => ({ ...r, scenario_scope: (r as any).scenario_scope ?? '', archived_at: null, is_confidential: 0 })));
     } catch {
       const list = db.prepare('SELECT id, name, created_at FROM scenarios ORDER BY created_at DESC').all() as any[];
-      res.json(list.map((r) => ({ ...r, source_scenario_id: null, source_scenario_name: null, updated_at: null, scenario_scope: '', archived_at: null })));
+      res.json(list.map((r) => ({ ...r, source_scenario_id: null, source_scenario_name: null, updated_at: null, scenario_scope: '', archived_at: null, is_confidential: 0 })));
     }
   }
 });
@@ -293,10 +320,17 @@ scenariosRouter.put('/:id/parts/:partId/volumes', (req, res) => {
   const body = (req.body ?? {}) as {
     mode?: unknown;
     volumes?: { year?: unknown; volume_value?: unknown; volume_unit?: unknown }[];
+    applyProduction?: unknown;
+    applyContract?: unknown;
   };
   const mode = String(body.mode ?? 'override').trim();
   if (mode !== 'override' && mode !== 'project') {
     return res.status(400).json({ error: 'Podaj mode: override lub project.' });
+  }
+  const applyProduction = body.applyProduction !== false;
+  const applyContract = body.applyContract !== false;
+  if (!applyProduction && !applyContract) {
+    return res.status(400).json({ error: 'Zaznacz wolumen produkcyjny albo kontraktowy.' });
   }
   try {
     const bundle = parseScenarioSnapshotJson(row.snapshot);
@@ -305,55 +339,126 @@ scenariosRouter.put('/:id/parts/:partId/volumes', (req, res) => {
     if (idx < 0) return res.status(404).json({ error: 'Detal nie występuje w tym scenariuszu.' });
     const part = parts[idx] as any;
     const projectId = Number(part.project_id) || null;
-    const before = bundle.part_volume_by_year || [];
-    const others = before.filter((r: any) => Number(r.part_id) !== partId);
-
-    if (mode === 'project') {
-      const hadOverride = String(part.volume_mode ?? 'project') === 'override';
-      if (!hadOverride && others.length === before.length) {
-        return res.json({ id: partId, volume_mode: 'project', volumes: [], unchanged: true });
-      }
-      part.volume_mode = 'project';
-      bundle.part_volume_by_year = others;
-      pushScenarioAudit(bundle, {
-        author: resolveScenarioActor(req),
-        note_type: 'auto',
-        note: `Wolumen detalu #${partId}: usunięto nadpisanie (dziedziczy z projektu).`,
-        project_id: projectId,
+    const beforeProduction = bundle.part_volume_by_year || [];
+    const beforeContract = bundle.part_volume_contract_by_year || [];
+    const productionOthers = beforeProduction.filter((r: any) => Number(r.part_id) !== partId);
+    const contractOthers = beforeContract.filter((r: any) => Number(r.part_id) !== partId);
+    const entries =
+      mode === 'override'
+        ? (Array.isArray(body.volumes) ? body.volumes : [])
+            .map((v) => ({
+              year: Math.trunc(Number(v?.year)),
+              volume_value: Number(v?.volume_value),
+              volume_unit: SCENARIO_VOLUME_UNITS.includes(v?.volume_unit as any) ? (v!.volume_unit as string) : 'annual',
+            }))
+            .filter(
+              (v) =>
+                Number.isFinite(v.year) &&
+                v.year >= 1900 &&
+                v.year <= 2200 &&
+                Number.isFinite(v.volume_value) &&
+                v.volume_value >= 0
+            )
+        : [];
+    if (mode === 'override' && entries.length === 0) {
+      return res.status(400).json({ error: 'Podaj przynajmniej jeden rok z wolumenem (≥ 0).' });
+    }
+    const before = {
+      volume_mode: String(part.volume_mode ?? 'project'),
+      contract_volume_mode: String(part.contract_volume_mode ?? 'project'),
+      part_volume_by_year: beforeProduction
+        .filter((r: any) => Number(r.part_id) === partId)
+        .map((r: any) => JSON.parse(JSON.stringify(r))),
+      part_volume_contract_by_year: beforeContract
+        .filter((r: any) => Number(r.part_id) === partId)
+        .map((r: any) => JSON.parse(JSON.stringify(r))),
+    };
+    const rowsFor = (yearRows: { year: number; volume_value: number; volume_unit: string }[]) =>
+      yearRows.map((e) => ({
         part_id: partId,
-      });
-    } else {
-      const entries = (Array.isArray(body.volumes) ? body.volumes : [])
-        .map((v) => ({
-          year: Math.trunc(Number(v?.year)),
-          volume_value: Number(v?.volume_value),
-          volume_unit: SCENARIO_VOLUME_UNITS.includes(v?.volume_unit as any) ? (v!.volume_unit as string) : 'annual',
-        }))
-        .filter(
-          (v) => Number.isFinite(v.year) && v.year >= 1900 && v.year <= 2200 && Number.isFinite(v.volume_value) && v.volume_value >= 0
-        );
-      if (entries.length === 0) {
-        return res.status(400).json({ error: 'Podaj przynajmniej jeden rok z wolumenem (≥ 0).' });
+        year: e.year,
+        volume_value: e.volume_value,
+        volume_unit: e.volume_unit,
+        volume_origin: 'manual_year',
+      }));
+    let changed = false;
+    if (applyProduction) {
+      if (mode === 'project') {
+        if (before.volume_mode !== 'project' || before.part_volume_by_year.length > 0) {
+          part.volume_mode = 'project';
+          bundle.part_volume_by_year = productionOthers;
+          changed = true;
+        }
+      } else {
+        part.volume_mode = 'override';
+        bundle.part_volume_by_year = [...productionOthers, ...rowsFor(entries)];
+        changed = true;
       }
-      part.volume_mode = 'override';
-      bundle.part_volume_by_year = [
-        ...others,
-        ...entries.map((e) => ({
-          part_id: partId,
-          year: e.year,
-          volume_value: e.volume_value,
-          volume_unit: e.volume_unit,
-          volume_origin: 'manual_year',
-        })),
-      ];
-      pushScenarioAudit(bundle, {
-        author: resolveScenarioActor(req),
-        note_type: 'auto',
-        note: `Wolumen detalu #${partId}: nadpisanie (tylko scenariusz) dla lat ${entries.map((e) => e.year).join(', ')}.`,
-        project_id: projectId,
-        part_id: partId,
+    }
+    if (applyContract) {
+      if (mode === 'project') {
+        if (before.contract_volume_mode !== 'project' || before.part_volume_contract_by_year.length > 0) {
+          part.contract_volume_mode = 'project';
+          bundle.part_volume_contract_by_year = contractOthers;
+          changed = true;
+        }
+      } else {
+        part.contract_volume_mode = 'override';
+        bundle.part_volume_contract_by_year = [...contractOthers, ...rowsFor(entries)];
+        changed = true;
+      }
+    }
+    const volumes = (bundle.part_volume_by_year || [])
+      .filter((r: any) => Number(r.part_id) === partId)
+      .sort((a: any, b: any) => Number(a.year) - Number(b.year));
+    const contractVolumes = (bundle.part_volume_contract_by_year || [])
+      .filter((r: any) => Number(r.part_id) === partId)
+      .sort((a: any, b: any) => Number(a.year) - Number(b.year));
+    if (!changed) {
+      return res.json({
+        id: partId,
+        volume_mode: part.volume_mode ?? 'project',
+        contract_volume_mode: part.contract_volume_mode ?? 'project',
+        volumes,
+        contract_volumes: contractVolumes,
+        unchanged: true,
       });
     }
+    if (!bundle.volume_edits) bundle.volume_edits = [];
+    const nextEditId = bundle.volume_edits.reduce((max, edit) => Math.max(max, Number(edit.id) || 0), 0) + 1;
+    const years =
+      mode === 'override'
+        ? entries.map((e) => e.year)
+        : [
+            ...new Set([
+              ...(applyProduction ? before.part_volume_by_year.map((r: any) => Number(r.year)) : []),
+              ...(applyContract ? before.part_volume_contract_by_year.map((r: any) => Number(r.year)) : []),
+            ]),
+          ].filter((year) => Number.isFinite(year));
+    bundle.volume_edits.push({
+      id: nextEditId,
+      at: new Date().toISOString(),
+      partId,
+      projectId,
+      applyProduction,
+      applyContract,
+      years,
+      mode: mode === 'project' ? 'project' : 'override',
+      before,
+    });
+    const partLabel = scenarioAssignedPartLabel(bundle, partId) || `detalu ${partId}`;
+    const scope = applyProduction && applyContract ? 'produkcyjny i kontraktowy' : applyContract ? 'kontraktowy' : 'produkcyjny';
+    const yearText = years.length > 0 ? years.slice().sort((a, b) => a - b).join(', ') : '—';
+    pushScenarioAudit(bundle, {
+      author: resolveScenarioActor(req),
+      note_type: 'auto',
+      note:
+        mode === 'project'
+          ? `Wolumen ${scope} detalu ${partLabel}: przywrócono wolumen projektu (tylko scenariusz), lata ${yearText}.`
+          : `Wolumen ${scope} detalu ${partLabel}: nadpisanie (tylko scenariusz) dla lat ${yearText}.`,
+      project_id: projectId,
+      part_id: partId,
+    });
     bundle.parts = parts;
     try {
       db.prepare(`UPDATE scenarios SET snapshot = ?, updated_at = datetime('now') WHERE id = ?`).run(JSON.stringify(bundle), id);
@@ -364,9 +469,9 @@ scenariosRouter.put('/:id/parts/:partId/volumes', (req, res) => {
     res.json({
       id: partId,
       volume_mode: part.volume_mode ?? 'project',
-      volumes: (bundle.part_volume_by_year || [])
-        .filter((r: any) => Number(r.part_id) === partId)
-        .sort((a: any, b: any) => Number(a.year) - Number(b.year)),
+      contract_volume_mode: part.contract_volume_mode ?? 'project',
+      volumes,
+      contract_volumes: contractVolumes,
     });
   } catch (e: any) {
     res.status(500).json({ error: e?.message || 'Błąd zapisu wolumenu detalu w scenariuszu' });
@@ -503,6 +608,161 @@ scenariosRouter.post('/:id/add-projects-from-capacity', (req, res) => {
   } catch (e: any) {
     res.status(500).json({ error: e?.message || 'Błąd dodawania projektów do scenariusza' });
   }
+});
+
+/** Nr linii maszyny tylko w snapshotcie scenariusza. Produkcja zostaje bez zmian. */
+scenariosRouter.patch('/:id/machines/:machineId/location', (req, res) => {
+  const id = Number(req.params.id);
+  const machineId = Number(req.params.machineId);
+  if (!Number.isFinite(machineId) || machineId <= 0) return res.status(400).json({ error: 'Nieprawidłowy identyfikator maszyny.' });
+  const row = db.prepare('SELECT snapshot, archived_at FROM scenarios WHERE id = ?').get(id) as
+    | { snapshot: string; archived_at: string | null }
+    | undefined;
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  if (row.archived_at != null && String(row.archived_at).trim() !== '') {
+    return res.status(400).json({ error: 'Scenariusz zarchiwizowany — zmiana linii jest wyłączona.' });
+  }
+  const machine = db.prepare('SELECT id, internal_number FROM machines WHERE id = ?').get(machineId) as
+    | { id: number; internal_number: string | number | null }
+    | undefined;
+  if (!machine) return res.status(404).json({ error: 'Maszyna nie znaleziona' });
+  const locRes = normalizeMachineLineLocationOptional((req.body as { location?: unknown })?.location);
+  if (!locRes.ok) return res.status(400).json({ error: locRes.error });
+  try {
+    const bundle = parseScenarioSnapshotJson(row.snapshot);
+    ensureScenarioMachineLocations(bundle);
+    const rows = bundle.machine_locations || [];
+    const idx = rows.findIndex((r) => Number(r.machine_id) === machineId);
+    const prev = idx >= 0 ? rows[idx].location ?? null : null;
+    const next = locRes.value;
+    if (String(prev ?? '') === String(next ?? '')) {
+      return res.json({ id: machineId, location: next, unchanged: true });
+    }
+    if (idx >= 0) rows[idx] = { machine_id: machineId, location: next };
+    else rows.push({ machine_id: machineId, location: next });
+    bundle.machine_locations = rows;
+    const label = machine.internal_number != null ? String(machine.internal_number) : `#${machineId}`;
+    pushScenarioAudit(bundle, {
+      author: resolveScenarioActor(req),
+      note_type: 'auto',
+      note: `Linia maszyny ${label}: „${prev ?? '—'}” → „${next ?? '—'}”.`,
+      machine_id: machineId,
+    });
+    try {
+      db.prepare(`UPDATE scenarios SET snapshot = ?, updated_at = datetime('now') WHERE id = ?`).run(JSON.stringify(bundle), id);
+    } catch {
+      db.prepare('UPDATE scenarios SET snapshot = ? WHERE id = ?').run(JSON.stringify(bundle), id);
+    }
+    saveDb();
+    res.json({ id: machineId, location: next });
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || 'Błąd zapisu linii w scenariuszu' });
+  }
+});
+
+/** Status maszyny tylko w snapshotcie scenariusza. Produkcja i inne scenariusze zostają bez zmian. */
+scenariosRouter.patch('/:id/machines/:machineId/status', (req, res) => {
+  const id = Number(req.params.id);
+  const machineId = Number(req.params.machineId);
+  if (!Number.isFinite(machineId) || machineId <= 0) return res.status(400).json({ error: 'Nieprawidłowy identyfikator maszyny.' });
+  const next = normalizeScenarioLineStatus((req.body as { status?: unknown })?.status);
+  if (!next) return res.status(400).json({ error: 'Status musi być active, inactive albo RFQ.' });
+  const row = db.prepare('SELECT snapshot, archived_at FROM scenarios WHERE id = ?').get(id) as
+    | { snapshot: string; archived_at: string | null }
+    | undefined;
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  if (row.archived_at != null && String(row.archived_at).trim() !== '') {
+    return res.status(400).json({ error: 'Scenariusz zarchiwizowany — zmiana statusu jest wyłączona.' });
+  }
+  const machine = db.prepare('SELECT id, internal_number FROM machines WHERE id = ?').get(machineId) as
+    | { id: number; internal_number: string | number | null }
+    | undefined;
+  if (!machine) return res.status(404).json({ error: 'Maszyna nie znaleziona' });
+  try {
+    const bundle = parseScenarioSnapshotJson(row.snapshot);
+    ensureScenarioMachineStatuses(bundle);
+    const rows = bundle.machine_statuses || [];
+    const idx = rows.findIndex((r) => Number(r.machine_id) === machineId);
+    const prev = idx >= 0 ? rows[idx].status : 'active';
+    if (prev === next) return res.json({ id: machineId, status: next, unchanged: true });
+    if (next === 'inactive') {
+      const block = forwardVolumeBlockForMachineInScenario(bundle, machineId);
+      if (block.blocked) {
+        return res.status(400).json({
+          error: `Nie można dezaktywować: od bieżącej daty zostaje wolumen (lata: ${block.years.join(', ')}). Przenieś lub wyzeruj ten wolumen w scenariuszu.`,
+        });
+      }
+    }
+    if (idx >= 0) rows[idx] = { machine_id: machineId, status: next };
+    else rows.push({ machine_id: machineId, status: next });
+    bundle.machine_statuses = rows;
+    const label = machine.internal_number != null ? String(machine.internal_number) : `#${machineId}`;
+    pushScenarioAudit(bundle, {
+      author: resolveScenarioActor(req),
+      note_type: 'auto',
+      note: `Status maszyny ${label}: „${prev}” → „${next}”.`,
+      machine_id: machineId,
+    });
+    try {
+      db.prepare(`UPDATE scenarios SET snapshot = ?, updated_at = datetime('now') WHERE id = ?`).run(JSON.stringify(bundle), id);
+    } catch {
+      db.prepare('UPDATE scenarios SET snapshot = ? WHERE id = ?').run(JSON.stringify(bundle), id);
+    }
+    saveDb();
+    res.json({ id: machineId, status: next });
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || 'Błąd zapisu statusu w scenariuszu' });
+  }
+});
+
+scenariosRouter.get('/:id/allocation-report', (req, res) => {
+  const id = Number(req.params.id);
+  const row = db.prepare('SELECT snapshot FROM scenarios WHERE id = ?').get(id) as { snapshot: string } | undefined;
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  try {
+    const bundle = parseScenarioSnapshotJson(row.snapshot);
+    const changed = collectScenarioAllocationMoves(bundle);
+    if (changed) {
+      try {
+        db.prepare(`UPDATE scenarios SET snapshot = ?, updated_at = datetime('now') WHERE id = ?`).run(JSON.stringify(bundle), id);
+      } catch {
+        db.prepare('UPDATE scenarios SET snapshot = ? WHERE id = ?').run(JSON.stringify(bundle), id);
+      }
+      saveDb();
+    }
+    res.json(buildScenarioAllocationReport(bundle));
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || 'Błąd raportu ruchów' });
+  }
+});
+
+scenariosRouter.get('/:id/allocation-moves', (req, res) => {
+  const id = Number(req.params.id);
+  const row = db.prepare('SELECT snapshot FROM scenarios WHERE id = ?').get(id) as { snapshot: string } | undefined;
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  try {
+    const bundle = parseScenarioSnapshotJson(row.snapshot);
+    const changed = collectScenarioAllocationMoves(bundle);
+    if (changed) {
+      try {
+        db.prepare(`UPDATE scenarios SET snapshot = ?, updated_at = datetime('now') WHERE id = ?`).run(JSON.stringify(bundle), id);
+      } catch {
+        db.prepare('UPDATE scenarios SET snapshot = ? WHERE id = ?').run(JSON.stringify(bundle), id);
+      }
+      saveDb();
+    }
+    const moves = listScenarioChanges(bundle);
+    res.json(moves);
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || 'Błąd odczytu ruchów' });
+  }
+});
+
+scenariosRouter.post('/:id/allocation-moves/undo', (req, res) => {
+  const id = Number(req.params.id);
+  const result = undoLastScenarioChange(id, resolveScenarioActor(req));
+  if (!result.success) return res.status(400).json({ error: result.error || 'Nie udało się cofnąć ruchu.' });
+  res.json({ ok: true, label: result.label });
 });
 
 scenariosRouter.post('/:id/apply-to-production', (req, res) => {
@@ -727,7 +987,7 @@ scenariosRouter.get('/:id/history', (req, res) => {
         project_id: r.project_id ?? null,
         note_date: r.note_date,
         author: r.author,
-        note: r.note,
+        note: humanizeScenarioHistoryNote(String(r.note ?? ''), bundle, machineById, refMode),
         note_type: r.note_type,
         machine_id: r.machine_id ?? null,
         part_id: r.part_id ?? null,
@@ -791,6 +1051,7 @@ scenariosRouter.get('/:id', (req, res) => {
         ? Number(row.source_call_off_comparison_id)
         : null,
     archived_at: row.archived_at != null && String(row.archived_at).trim() !== '' ? String(row.archived_at) : null,
+    is_confidential: Number(row.is_confidential) === 1,
     snapshot,
   });
 });
@@ -809,6 +1070,14 @@ scenariosRouter.post('/', (req, res) => {
       : null;
   const sourceCallOffComparisonId =
     rawCallOff != null && Number.isFinite(rawCallOff) && rawCallOff > 0 ? rawCallOff : null;
+  const confidential =
+    body?.confidential === true || body?.confidential === 1 || String(body?.confidential ?? '').toLowerCase() === 'true';
+  if (confidential && !canViewConfidentialScenarios(req)) {
+    return res.status(403).json({ error: 'Brak uprawnienia do tworzenia scenariuszy poufnych.' });
+  }
+  if (sourceScenarioId != null && isScenarioHiddenFromRequest(req, sourceScenarioId)) {
+    return res.status(404).json({ error: 'Nie znaleziono scenariusza źródłowego' });
+  }
 
   if (sourceCallOffComparisonId != null) {
     const cmp = db.prepare('SELECT id FROM call_off_comparisons WHERE id = ?').get(sourceCallOffComparisonId);
@@ -835,9 +1104,9 @@ scenariosRouter.post('/', (req, res) => {
 
   try {
     const insert = db.prepare(
-      `INSERT INTO scenarios (name, snapshot, source_scenario_id, source_call_off_comparison_id, updated_at, scenario_scope) VALUES (?, ?, ?, ?, datetime('now'), ?)`
+      `INSERT INTO scenarios (name, snapshot, source_scenario_id, source_call_off_comparison_id, updated_at, scenario_scope, is_confidential) VALUES (?, ?, ?, ?, datetime('now'), ?, ?)`
     );
-    const r = insert.run(name, bundleJson, sourceScenarioId, sourceCallOffComparisonId, scenario_scope);
+    const r = insert.run(name, bundleJson, sourceScenarioId, sourceCallOffComparisonId, scenario_scope, confidential ? 1 : 0);
     const newId = Number(r.lastInsertRowid);
     const row = db
       .prepare(
@@ -845,8 +1114,11 @@ scenariosRouter.post('/', (req, res) => {
       )
       .get(newId) as any;
     saveDb();
-    res.status(201).json(row);
+    res.status(201).json({ ...row, is_confidential: confidential ? 1 : 0 });
   } catch (e: any) {
+    if (confidential) {
+      return res.status(500).json({ error: e?.message || 'Nie udało się zapisać scenariusza poufnego.' });
+    }
     if (String(e?.message || '').includes('no such column')) {
       try {
         const insert = db.prepare(

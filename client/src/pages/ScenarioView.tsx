@@ -143,6 +143,10 @@ export default function ScenarioView() {
   const [volumeDraft, setVolumeDraft] = useState<VolumeDraftRow[]>([]);
   const [volumeSaving, setVolumeSaving] = useState(false);
   const [volumeError, setVolumeError] = useState<string | null>(null);
+  const [selectedVolumeYears, setSelectedVolumeYears] = useState<number[]>([]);
+  const [volumeIncrease, setVolumeIncrease] = useState('');
+  const [applyProductionVolume, setApplyProductionVolume] = useState(true);
+  const [applyContractVolume, setApplyContractVolume] = useState(true);
 
   useEffect(() => {
     if (!id) return;
@@ -381,23 +385,56 @@ export default function ScenarioView() {
     }
   };
 
-  /** Otwiera modal wolumenu detalu — wypełniony istniejącym nadpisaniem (jeśli jest) albo zerami dla lat SOP–EOP projektu. */
+  /** Bieżący wolumen detalu w scenariuszu: nadpisanie, udział albo wolumen projektu. */
+  const effectiveVolumeDraft = (p: any, pt: any, year: number): VolumeDraftRow => {
+    const snap = scenario?.snapshot as any;
+    const partId = Number(pt.id);
+    const projectId = Number(p?.id);
+    const override = ((snap?.part_volume_by_year as any[]) ?? []).find(
+      (r: any) => Number(r.part_id) === partId && Number(r.year) === year
+    );
+    const mode = String(pt.volume_mode ?? 'project');
+    const asUnit = (u: unknown): VolumeUnit =>
+      u === 'monthly' || u === 'weekly' || u === 'annual' ? u : 'annual';
+    const fmt = (n: number) => String(Math.round(n * 1000) / 1000);
+    if (mode === 'override' && override) {
+      return { year, volume_value: fmt(Number(override.volume_value) || 0), volume_unit: asUnit(override.volume_unit) };
+    }
+    if (mode === 'override' && pt.default_volume_value != null && pt.default_volume_unit) {
+      return { year, volume_value: fmt(Number(pt.default_volume_value) || 0), volume_unit: asUnit(pt.default_volume_unit) };
+    }
+    const pv = ((snap?.project_volumes as any[]) ?? []).find(
+      (r: any) => Number(r.project_id) === projectId && Number(r.year) === year
+    );
+    if (pv && mode === 'share') {
+      const shareRow = ((snap?.part_volume_share_by_year as any[]) ?? []).find(
+        (r: any) => Number(r.part_id) === partId && Number(r.year) === year
+      );
+      const sharePct = shareRow != null ? Number(shareRow.share_percent) : Number(pt.volume_share_percent);
+      if (Number.isFinite(sharePct)) {
+        const share = Math.max(0, Math.min(100, sharePct)) / 100;
+        return { year, volume_value: fmt(Number(pv.volume_value) * share), volume_unit: asUnit(pv.volume_unit) };
+      }
+    }
+    if (pv) return { year, volume_value: fmt(Number(pv.volume_value) || 0), volume_unit: asUnit(pv.volume_unit) };
+    return { year, volume_value: '0', volume_unit: 'annual' };
+  };
+
+  /** Otwiera modal wolumenu detalu — wypełniony bieżącym wolumenem lat SOP–EOP. */
   const openVolumeModal = (p: any, pt: any) => {
     setVolumeError(null);
+    setVolumeIncrease('');
+    setSelectedVolumeYears([]);
+    setApplyProductionVolume(true);
+    setApplyContractVolume(true);
     const range = sopEopYearsRange(p?.sop, p?.eop).years;
     const existing = ((scenario?.snapshot?.part_volume_by_year as any[]) ?? []).filter(
       (r: any) => Number(r.part_id) === Number(pt.id)
     );
-    const existingByYear = new Map(existing.map((r: any) => [Number(r.year), r]));
     const years = [...new Set<number>([...range, ...existing.map((r: any) => Number(r.year))])].sort((a, b) => a - b);
-    const draft: VolumeDraftRow[] = (years.length > 0 ? years : [new Date().getFullYear()]).map((year) => {
-      const row = existingByYear.get(year);
-      return {
-        year,
-        volume_value: row ? String(row.volume_value) : '0',
-        volume_unit: (row?.volume_unit as VolumeUnit) ?? 'annual',
-      };
-    });
+    const draft: VolumeDraftRow[] = (years.length > 0 ? years : [new Date().getFullYear()]).map((year) =>
+      effectiveVolumeDraft(p, pt, year)
+    );
     setVolumeDraft(draft);
     setVolumeModalPart({ part: pt, project: p });
   };
@@ -412,27 +449,80 @@ export default function ScenarioView() {
     setVolumeDraft((prev) => prev.map((r) => (r.year === year ? { ...r, [field]: value } : r)));
   };
 
+  const applyVolumeIncrease = () => {
+    const delta = Number(String(volumeIncrease).trim().replace(',', '.'));
+    if (!Number.isFinite(delta)) {
+      setVolumeError('Podaj liczbę, o jaką zwiększyć wolumen.');
+      return;
+    }
+    if (selectedVolumeYears.length === 0) {
+      setVolumeError('Zaznacz lata, których wolumen ma wzrosnąć.');
+      return;
+    }
+    const picked = new Set(selectedVolumeYears);
+    setVolumeError(null);
+    setVolumeDraft((prev) =>
+      prev.map((r) => {
+        if (!picked.has(r.year)) return r;
+        const base = Number(String(r.volume_value).replace(',', '.'));
+        const next = (Number.isFinite(base) ? base : 0) + delta;
+        return { ...r, volume_value: String(Math.round(Math.max(0, next) * 1000) / 1000) };
+      })
+    );
+  };
+
   /** Zapisuje w snapshotcie lokalnie (bez ponownego GET) — odpowiedź serwera ma znormalizowane wiersze. */
   const applyPartVolumeResult = (
     partId: number,
-    res: { volume_mode: string; volumes: { part_id: number; year: number; volume_value: number; volume_unit: string }[] }
+    res: {
+      volume_mode: string;
+      contract_volume_mode?: string;
+      volumes: { part_id: number; year: number; volume_value: number; volume_unit: string }[];
+      contract_volumes?: { part_id: number; year: number; volume_value: number; volume_unit: string }[];
+    }
   ) => {
     setScenario((s) => {
       if (!s?.snapshot) return s;
       const nextParts = ((s.snapshot.parts as any[]) ?? []).map((pt: any) =>
-        Number(pt.id) === partId ? { ...pt, volume_mode: res.volume_mode } : pt
+        Number(pt.id) === partId
+          ? {
+              ...pt,
+              volume_mode: res.volume_mode,
+              ...(res.contract_volume_mode != null ? { contract_volume_mode: res.contract_volume_mode } : {}),
+            }
+          : pt
       );
       const others = ((s.snapshot.part_volume_by_year as any[]) ?? []).filter((r: any) => Number(r.part_id) !== partId);
+      const contractOthers = ((s.snapshot.part_volume_contract_by_year as any[]) ?? []).filter(
+        (r: any) => Number(r.part_id) !== partId
+      );
       return {
         ...s,
-        snapshot: { ...s.snapshot, parts: nextParts, part_volume_by_year: [...others, ...res.volumes] },
+        snapshot: {
+          ...s.snapshot,
+          parts: nextParts,
+          part_volume_by_year: [...others, ...res.volumes],
+          ...(res.contract_volumes != null
+            ? { part_volume_contract_by_year: [...contractOthers, ...res.contract_volumes] }
+            : {}),
+        },
       };
     });
+  };
+
+  const volumeTargets = (): { applyProduction: boolean; applyContract: boolean } | null => {
+    if (!applyProductionVolume && !applyContractVolume) {
+      setVolumeError('Zaznacz wolumen produkcyjny albo kontraktowy.');
+      return null;
+    }
+    return { applyProduction: applyProductionVolume, applyContract: applyContractVolume };
   };
 
   const saveVolumeOverride = async () => {
     const sid = scenario?.id;
     if (!sid || !volumeModalPart) return;
+    const targets = volumeTargets();
+    if (!targets) return;
     const entries = volumeDraft
       .map((d) => ({ year: Number(d.year), volume_value: Number(d.volume_value), volume_unit: d.volume_unit }))
       .filter((d) => Number.isFinite(d.year) && Number.isFinite(d.volume_value) && d.volume_value >= 0);
@@ -443,7 +533,11 @@ export default function ScenarioView() {
     setVolumeSaving(true);
     setVolumeError(null);
     try {
-      const res = await api.scenarios.putPartVolumes(sid, Number(volumeModalPart.part.id), { mode: 'override', volumes: entries });
+      const res = await api.scenarios.putPartVolumes(sid, Number(volumeModalPart.part.id), {
+        mode: 'override',
+        volumes: entries,
+        ...targets,
+      });
       applyPartVolumeResult(Number(volumeModalPart.part.id), res);
       setVolumeModalPart(null);
     } catch (e: any) {
@@ -456,10 +550,12 @@ export default function ScenarioView() {
   const resetVolumeOverride = async () => {
     const sid = scenario?.id;
     if (!sid || !volumeModalPart) return;
+    const targets = volumeTargets();
+    if (!targets) return;
     setVolumeSaving(true);
     setVolumeError(null);
     try {
-      const res = await api.scenarios.putPartVolumes(sid, Number(volumeModalPart.part.id), { mode: 'project' });
+      const res = await api.scenarios.putPartVolumes(sid, Number(volumeModalPart.part.id), { mode: 'project', ...targets });
       applyPartVolumeResult(Number(volumeModalPart.part.id), res);
       setVolumeModalPart(null);
     } catch (e: any) {
@@ -778,19 +874,59 @@ export default function ScenarioView() {
               Wolumen detalu: {partLabel(volumeModalPart.part)}
             </h2>
             <p style={{ color: '#555', fontSize: 13, lineHeight: 1.45, marginBottom: 12 }}>
-              Zmiana obowiązuje tylko w tym scenariuszu — nie wpływa na kalkulator produkcyjny. Bieżący tryb:{' '}
-              <strong>
-                {String(volumeModalPart.part.volume_mode ?? 'project') === 'override'
-                  ? 'nadpisanie (scenariusz)'
-                  : 'dziedziczy z projektu'}
-              </strong>
-              .
+              Zmiana obowiązuje tylko w tym scenariuszu — nie wpływa na kalkulator produkcyjny. Wpisane wartości trafiają do
+              zaznaczonych wolumenów. Odznacz checkbox, aby zostawić dany wolumen bez zmian.
             </p>
+            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 12 }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+                <input
+                  type="checkbox"
+                  checked={applyProductionVolume}
+                  onChange={(e) => setApplyProductionVolume(e.target.checked)}
+                />
+                Wolumen produkcyjny
+              </label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+                <input
+                  type="checkbox"
+                  checked={applyContractVolume}
+                  onChange={(e) => setApplyContractVolume(e.target.checked)}
+                />
+                Wolumen kontraktowy
+              </label>
+            </div>
             {volumeError ? <p style={{ color: 'var(--cap-red)', marginBottom: 8, fontSize: 13 }}>{volumeError}</p> : null}
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginBottom: 10 }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+                <input
+                  type="checkbox"
+                  checked={volumeDraft.length > 0 && selectedVolumeYears.length === volumeDraft.length}
+                  onChange={(e) => setSelectedVolumeYears(e.target.checked ? volumeDraft.map((r) => r.year) : [])}
+                />
+                zaznacz wszystkie
+              </label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+                Zwiększ o
+                <input
+                  type="number"
+                  value={volumeIncrease}
+                  onChange={(e) => setVolumeIncrease(e.target.value)}
+                  style={{ width: 110, padding: '0.3rem', border: '1px solid #ccc', borderRadius: 4 }}
+                />
+              </label>
+              <button
+                type="button"
+                onClick={applyVolumeIncrease}
+                style={{ padding: '0.35rem 0.7rem', background: '#1565c0', color: 'white', border: 'none', borderRadius: 4, cursor: 'pointer' }}
+              >
+                Zastosuj do zaznaczonych
+              </button>
+            </div>
             <div style={{ overflow: 'auto', maxHeight: 'min(48vh, 380px)', border: '1px solid #e0e0e0', borderRadius: 6, marginBottom: 12 }}>
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
                 <thead>
                   <tr style={{ background: '#f5f5f5', position: 'sticky', top: 0 }}>
+                    <th style={{ padding: '0.4rem', textAlign: 'left', width: 36 }} />
                     <th style={{ padding: '0.4rem', textAlign: 'left' }}>Rok</th>
                     <th style={{ padding: '0.4rem', textAlign: 'left' }}>Wolumen</th>
                     <th style={{ padding: '0.4rem', textAlign: 'left' }}>Jednostka</th>
@@ -799,6 +935,17 @@ export default function ScenarioView() {
                 <tbody>
                   {volumeDraft.map((row) => (
                     <tr key={row.year} style={{ borderTop: '1px solid #eee' }}>
+                      <td style={{ padding: '0.35rem 0.4rem' }}>
+                        <input
+                          type="checkbox"
+                          checked={selectedVolumeYears.includes(row.year)}
+                          onChange={(e) =>
+                            setSelectedVolumeYears((prev) =>
+                              e.target.checked ? [...prev, row.year] : prev.filter((y) => y !== row.year)
+                            )
+                          }
+                        />
+                      </td>
                       <td style={{ padding: '0.35rem 0.4rem', fontWeight: 600 }}>{row.year}</td>
                       <td style={{ padding: '0.35rem 0.4rem' }}>
                         <input
@@ -830,7 +977,7 @@ export default function ScenarioView() {
                 type="button"
                 disabled={volumeSaving}
                 onClick={() => void resetVolumeOverride()}
-                title="Usuwa nadpisanie — detal wraca do wolumenu dziedziczonego z projektu"
+                title="Usuwa nadpisanie zaznaczonych wolumenów — wracają do wolumenu dziedziczonego z projektu"
                 style={{
                   padding: '0.5rem 1rem',
                   background: '#fff',

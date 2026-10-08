@@ -5,7 +5,8 @@ export type PermissionAction =
   | 'edit'
   | 'delete'
   | 'download'
-  | 'create_rfq';
+  | 'create_rfq'
+  | 'view_confidential';
 
 export type PermissionResource =
   | 'calculator'
@@ -28,7 +29,7 @@ export const PERMISSION_MATRIX: Record<PermissionResource, PermissionAction[]> =
   machines: ['view', 'details', 'change_status', 'edit', 'delete', 'download'],
   projects: ['view', 'details', 'change_status', 'edit', 'delete', 'create_rfq'],
   designations: ['view', 'edit', 'delete', 'download'],
-  scenarios: ['view', 'edit', 'delete', 'download'],
+  scenarios: ['view', 'edit', 'delete', 'download', 'view_confidential'],
   call_offs: ['view', 'edit', 'delete', 'download'],
   admin_database: ['view', 'edit', 'download'],
   admin_settings: ['view', 'edit', 'download'],

@@ -8,6 +8,8 @@ import {
   getEffectiveVolumeForPartScenarioPreferContract,
   resolveSettingsForScenarioYear,
   scenarioHydratedOperationsForActiveProjects,
+  scenarioLocationByMachineId,
+  scenarioStatusByMachineId,
   effectiveOperationStatus,
 } from './scenarioSnapshotService.js';
 import {
@@ -1375,6 +1377,112 @@ export function resolveOperationVolumeForYear(
   };
 }
 
+export type SourceMachineWeekly = {
+  volumeValue: number;
+  volumeUnit: 'annual' | 'monthly' | 'weekly';
+  volumeOrigin: VolumeEntryOrigin;
+  countAfterEop?: boolean;
+  source: OperationVolumeSource;
+  /** Tygodniowy wolumen tak jak w obciążeniu maszyny, z niepełnym rokiem SOP–EOP. */
+  displayWeekly: number;
+  fraction: number;
+  /**
+   * Zapisana waga udziału (wiersz roku bez zagęszczania niepełnego roku).
+   * Przeniesienie 100% displayWeekly zabiera całą tę wagę, więc udział rodziny zostaje ten sam.
+   */
+  shareWeightWeekly: number | null;
+};
+
+/**
+ * Wolumen operacji na maszynie źródłowej — ten sam co kalkulator (udział rodziny × detal, niepełny rok).
+ * Mapa roku i indeks podziału są jak przy liczeniu obciążenia.
+ */
+export function resolveSourceMachineWeeklyForAllocation(args: {
+  operationId: number;
+  projectId: number | null;
+  partId: number | null;
+  volumeValue: number;
+  volumeUnit: string;
+  splitFromOperationId?: number | null;
+  year: number;
+  opYearRow: OperationYearVolumeRow | null;
+  scenarioSnapshot: ScenarioBundle | null;
+  useContractualVolumes: boolean;
+  settings: Parameters<typeof volumeToWeekly>[2];
+  sop: string;
+  eop: string;
+  volumeMap: Map<number, OperationYearVolumeRow>;
+  splitOperations?: { id?: number; operation_id?: number; split_from_operation_id?: number | null }[] | null;
+}): SourceMachineWeekly {
+  const rateRow =
+    args.opYearRow == null
+      ? null
+      : args.opYearRow.effective_from_month == null
+        ? args.opYearRow
+        : {
+            volume_value: args.opYearRow.volume_value,
+            volume_unit: args.opYearRow.volume_unit,
+            volume_value_before: null,
+            effective_from_month: null,
+            effective_from_week: null,
+            source: args.opYearRow.source ?? null,
+          };
+  const map = new Map(args.volumeMap);
+  if (rateRow) map.set(args.operationId, rateRow);
+  const splitIndex =
+    args.scenarioSnapshot != null
+      ? mergeAllocationSplitIndexes(
+          buildAllocationSplitIndexFromOperations(args.splitOperations ?? []),
+          ensureAllocationSplitIndex()
+        )
+      : ensureAllocationSplitIndex();
+  const resolved = resolveOperationVolumeForYear(
+    {
+      operation_id: args.operationId,
+      project_id: args.projectId,
+      part_id: args.partId,
+      volume_value: args.volumeValue,
+      volume_unit: args.volumeUnit,
+      split_from_operation_id: args.splitFromOperationId ?? null,
+    },
+    args.year,
+    rateRow,
+    args.scenarioSnapshot,
+    args.useContractualVolumes,
+    undefined,
+    undefined,
+    undefined,
+    map,
+    true,
+    splitIndex
+  );
+  const weeklyResolved = resolveWeeklyVolumeFromResolved(resolved.volume_value, resolved.volume_unit, args.settings, {
+    sop: args.sop,
+    eop: args.eop,
+    year: args.year,
+    volume_origin: resolved.volume_origin,
+    count_after_eop: resolved.count_after_eop,
+    has_project: args.projectId != null,
+  });
+  let shareWeightWeekly: number | null = null;
+  if (resolved.source === 'part' && rateRow && weeklyResolved.weekly > 1e-9) {
+    const unit =
+      rateRow.volume_unit === 'monthly' || rateRow.volume_unit === 'weekly' ? rateRow.volume_unit : 'annual';
+    const raw = volumeToWeekly(Number(rateRow.volume_value) || 0, unit, args.settings);
+    if (raw > 1e-9) shareWeightWeekly = raw;
+  }
+  return {
+    volumeValue: resolved.volume_value,
+    volumeUnit: resolved.volume_unit,
+    volumeOrigin: resolved.volume_origin,
+    countAfterEop: resolved.count_after_eop,
+    source: resolved.source,
+    displayWeekly: weeklyResolved.weekly,
+    fraction: weeklyResolved.fraction,
+    shareWeightWeekly,
+  };
+}
+
 export interface MachineCapacityRow {
   machine_id: number;
   internal_number: string | number;
@@ -1524,6 +1632,24 @@ function buildMachineStatusWhere(
     clause: `m.status IN (${unique.map(() => '?').join(',')})`,
     params: unique,
   };
+}
+
+/** Status ze snapshotu scenariusza — filtr po załadowaniu, bez kolumny produkcji. */
+function machinePassesScenarioStatus(
+  status: string,
+  machineId: number,
+  filters: CalculatorMachineStatusFilter[],
+  scenarioRfqs: number[],
+  extraRfqIds: number[]
+): boolean {
+  if (extraRfqIds.includes(machineId)) return true;
+  if (filters.length === 0) return true;
+  const unique = [...new Set(filters)];
+  if (unique.includes(status as CalculatorMachineStatusFilter)) return true;
+  if (unique.length === 1 && unique[0] === 'active' && status === 'RFQ' && scenarioRfqs.includes(machineId)) {
+    return true;
+  }
+  return false;
 }
 
 type CallOffVolumeMaps = import('./callOffService.js').CallOffVolumeMaps;
@@ -1795,9 +1921,13 @@ export function getMachineCapacitiesForYear(
     msList.length > 0 ? msList : machineStatusFilter === undefined ? ['active'] : [];
   const statusWhere = buildMachineStatusWhere(effectiveStatuses, scenarioRfqs);
   const rfqMachineIds = computeShared.includeRfqMachineIds ?? [];
+  const scenarioStatuses = scenarioStatusByMachineId(scenarioSnapshotEff);
   let machineStatusClause = statusWhere.clause;
   const machineStatusParams: (number | string)[] = [...statusWhere.params];
-  if (rfqMachineIds.length) {
+  if (scenarioStatuses) {
+    machineStatusClause = '1=1';
+    machineStatusParams.length = 0;
+  } else if (rfqMachineIds.length) {
     machineStatusClause = `(${statusWhere.clause}) OR m.id IN (${rfqMachineIds.map(() => '?').join(',')})`;
     machineStatusParams.push(...rfqMachineIds);
   }
@@ -1836,7 +1966,23 @@ export function getMachineCapacitiesForYear(
   }
   machinesSql += ' ORDER BY m.internal_number';
 
-  const machines = db.prepare(machinesSql).all(...params) as any[];
+  let machines = db.prepare(machinesSql).all(...params) as any[];
+  const scenarioLocations = scenarioLocationByMachineId(scenarioSnapshotEff);
+  if (scenarioLocations || scenarioStatuses) {
+    machines = machines.filter((m) => {
+      const id = Number(m.machine_id);
+      if (scenarioLocations?.has(id)) m.location = scenarioLocations.get(id);
+      if (scenarioStatuses?.has(id)) m.machine_status = scenarioStatuses.get(id) ?? null;
+      if (!scenarioStatuses) return true;
+      return machinePassesScenarioStatus(
+        String(m.machine_status ?? 'active'),
+        id,
+        effectiveStatuses,
+        scenarioRfqs,
+        rfqMachineIds
+      );
+    });
+  }
   const operations = computeShared.operations;
   const operationsByMachine = computeShared.operationsByMachine;
   const volumeMap = computeShared.opVolumeMapByYear.get(year) ?? new Map();
@@ -2258,6 +2404,8 @@ export function getMachineLoadComputationDetails(
   `)
     .get(machineId) as any;
   if (!mCandidate) return null;
+  const scenarioStatuses = scenarioStatusByMachineId(scenarioSnapshot);
+  if (scenarioStatuses?.has(machineId)) mCandidate.status = scenarioStatuses.get(machineId);
   const st = String(mCandidate.status ?? 'active');
   if (st === 'inactive') return null;
   if (st === 'RFQ') {
@@ -3426,15 +3574,19 @@ function resolveScopeMachineIds(
       : [];
   const statusWhere = buildMachineStatusWhere(effectiveStatuses, scenarioRfqs);
   const rfqMachineIds = resolveMachineIdsForRfqOperations(opts.includeRfqOperationIds ?? []);
+  const scenarioStatuses = scenarioStatusByMachineId(opts.scenarioSnapshot);
   let machineStatusClause = statusWhere.clause;
   const machineStatusParams: (number | string)[] = [...statusWhere.params];
-  if (rfqMachineIds.length) {
+  if (scenarioStatuses) {
+    machineStatusClause = '1=1';
+    machineStatusParams.length = 0;
+  } else if (rfqMachineIds.length) {
     machineStatusClause = `(${statusWhere.clause}) OR m.id IN (${rfqMachineIds.map(() => '?').join(',')})`;
     machineStatusParams.push(...rfqMachineIds);
   }
 
   let machinesSql = `
-    SELECT m.id AS machine_id, m.location
+    SELECT m.id AS machine_id, m.location, m.status AS machine_status
     FROM machines m
     WHERE ${machineStatusClause}
   `;
@@ -3459,7 +3611,27 @@ function resolveScopeMachineIds(
     }
   }
 
-  const machines = db.prepare(machinesSql).all(...params) as { machine_id: number; location: string | null }[];
+  let machines = db.prepare(machinesSql).all(...params) as {
+    machine_id: number;
+    location: string | null;
+    machine_status: string | null;
+  }[];
+  const scenarioLocations = scenarioLocationByMachineId(opts.scenarioSnapshot);
+  if (scenarioLocations || scenarioStatuses) {
+    machines = machines.filter((m) => {
+      const id = Number(m.machine_id);
+      if (scenarioLocations?.has(id)) m.location = scenarioLocations.get(id) ?? null;
+      if (scenarioStatuses?.has(id)) m.machine_status = scenarioStatuses.get(id) ?? null;
+      if (!scenarioStatuses) return true;
+      return machinePassesScenarioStatus(
+        String(m.machine_status ?? 'active'),
+        id,
+        effectiveStatuses,
+        scenarioRfqs,
+        rfqMachineIds
+      );
+    });
+  }
   return machines
     .filter((m) => {
       if (scope.kind === 'machine') return m.machine_id === scope.machineId;
@@ -3890,4 +4062,58 @@ export function getCapacityScopeBreakdown(
   }
 
   return out;
+}
+
+const VOLUME_YEAR_EPS = 1e-6;
+
+function yearsBetweenSopEop(sop: unknown, eop: unknown): number[] {
+  const start = parseSopEop(sop);
+  const end = parseSopEop(eop);
+  if (!start || !end || end.year < start.year) return [];
+  const years: number[] = [];
+  for (let year = start.year; year <= end.year; year++) years.push(year);
+  return years;
+}
+
+/** Lata, w których operacja ma wolumen > 0. Kandydaci: SOP–EOP oraz jawne wiersze wolumenu. */
+export function positiveVolumeYearsForOperation(
+  op: {
+    operation_id: number;
+    project_id: number | null;
+    part_id: number | null;
+    volume_value: number;
+    volume_unit: string;
+    split_from_operation_id?: number | null;
+    sop?: unknown;
+    eop?: unknown;
+  },
+  extraYears: number[],
+  opYearByYear: Map<number, OperationYearVolumeRow>,
+  scenarioSnapshot: ScenarioBundle | null,
+  useContractualVolumes: boolean
+): number[] {
+  const candidates = new Set<number>(yearsBetweenSopEop(op.sop, op.eop));
+  for (const year of extraYears) {
+    if (Number.isFinite(year) && year >= 1990 && year <= 2200) candidates.add(year);
+  }
+  for (const year of opYearByYear.keys()) candidates.add(year);
+  const kept: number[] = [];
+  for (const year of [...candidates].sort((a, b) => a - b)) {
+    const resolved = resolveOperationVolumeForYear(
+      {
+        operation_id: op.operation_id,
+        project_id: op.project_id,
+        part_id: op.part_id,
+        volume_value: Number(op.volume_value) || 0,
+        volume_unit: op.volume_unit || 'annual',
+        split_from_operation_id: op.split_from_operation_id ?? null,
+      },
+      year,
+      opYearByYear.get(year) ?? null,
+      scenarioSnapshot,
+      useContractualVolumes
+    );
+    if (Math.abs(Number(resolved.volume_value)) > VOLUME_YEAR_EPS) kept.push(year);
+  }
+  return kept;
 }

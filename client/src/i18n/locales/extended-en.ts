@@ -1400,6 +1400,7 @@ export const extendedEn: TranslationTree = {
     permDelete: 'Delete',
     permDownload: 'Download',
     permCreateRfq: 'Create RFQ',
+    permViewConfidential: 'Confidential',
     permCalculator: 'Calculator',
     permMachines: 'Machines',
     permProjects: 'Projects',
@@ -1416,6 +1417,8 @@ export const extendedEn: TranslationTree = {
     permRoleManagement: 'Role management',
     permCreateRfqHint:
       'Create RFQ: the user may only create projects with RFQ status and edit parts, operations and volumes on those projects.',
+    permConfidentialHint:
+      'Scenarios → Confidential: view, edit and calculate scenarios marked confidential. Without this permission those scenarios stay hidden.',
     permAttachmentsDownloadHint:
       'Attachments: View = admin inventory. Download = download project attachment files. Turning off View also clears Download. Without Download, the download action is unavailable.',
     permCallOffsDownloadHint:

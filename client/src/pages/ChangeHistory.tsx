@@ -45,6 +45,21 @@ export default function ChangeHistory() {
   const [rows, setRows] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [moves, setMoves] = useState<
+    {
+      kind?: 'allocation' | 'volume';
+      id: number;
+      at: string;
+      years: number[];
+      partLabel: string;
+      sourceLabel: string;
+      targetLabel: string;
+      scopeLabel?: string;
+      canUndo: boolean;
+    }[]
+  >([]);
+  const [undoBusy, setUndoBusy] = useState(false);
+  const [undoError, setUndoError] = useState<string | null>(null);
   const [meta, setMeta] = useState<{
     projects: { id: number; client: string; name: string }[];
     clients: string[];
@@ -77,13 +92,40 @@ export default function ChangeHistory() {
       .finally(() => setLoading(false));
   };
 
+  const loadMoves = () => {
+    if (scopedScenarioId == null) {
+      setMoves([]);
+      return;
+    }
+    api.scenarios
+      .allocationMoves(scopedScenarioId)
+      .then(setMoves)
+      .catch(() => setMoves([]));
+  };
+
   useEffect(() => {
     if (scopedScenarioId != null) {
       api.scenarios.historyFilters(scopedScenarioId).then(setMeta).catch(() => {});
     } else {
       api.projects.historyFilters().then(setMeta).catch(() => {});
     }
+    loadMoves();
   }, [scopedScenarioId]);
+
+  const undoLatestMove = async () => {
+    if (scopedScenarioId == null || undoBusy) return;
+    setUndoBusy(true);
+    setUndoError(null);
+    try {
+      await api.scenarios.undoAllocationMove(scopedScenarioId);
+      load();
+      loadMoves();
+    } catch (e: any) {
+      setUndoError(e?.message || 'Nie udało się cofnąć ruchu.');
+    } finally {
+      setUndoBusy(false);
+    }
+  };
 
   useEffect(() => {
     load();
@@ -150,6 +192,49 @@ export default function ChangeHistory() {
           <strong>{t('history.scenarioFootnoteBold', { id: scopedScenarioId })}</strong> {t('history.scenarioFootnoteDetails')}{' '}
           {t('history.scenarioFootnoteFull')}
         </p>
+      )}
+      {scopedScenarioId != null && (
+        <div style={{ marginBottom: '1rem', padding: '0.75rem 1rem', background: '#f5f9fc', border: '1px solid #d0e3f0', borderRadius: 8 }}>
+          <h2 style={{ margin: '0 0 0.5rem', fontSize: '1rem' }}>Ruchy do cofnięcia</h2>
+          <p style={{ margin: '0 0 0.5rem', fontSize: 13, color: '#555' }}>
+            Najnowszy ruch jest na górze. Cofnięcie dotyczy całego kliknięcia (alokacja albo zmiana wolumenu) i tylko ostatniego ruchu.
+          </p>
+          {undoError ? <p style={{ color: 'var(--cap-red)', fontSize: 13 }}>{undoError}</p> : null}
+          {moves.length === 0 ? (
+            <p style={{ margin: 0, fontSize: 13, color: '#777' }}>Brak zapisanych ruchów do cofnięcia.</p>
+          ) : (
+            <ul style={{ margin: 0, paddingLeft: 18, fontSize: 14 }}>
+              {moves.map((move) => (
+                <li key={`${move.kind || 'allocation'}-${move.id}`} style={{ marginBottom: 6 }}>
+                  <span>
+                    {move.kind === 'volume'
+                      ? `Wolumen ${move.scopeLabel || 'produkcyjny'} ${move.partLabel || 'detalu'}, lata ${move.years.join(', ') || '—'}`
+                      : `${move.partLabel || 'detal'} — ${move.sourceLabel || '—'} → ${move.targetLabel || '—'}, lata ${move.years.join(', ') || '—'}`}
+                    {move.at ? ` (${move.at.slice(0, 16).replace('T', ' ')})` : ''}
+                  </span>
+                  {move.canUndo ? (
+                    <button
+                      type="button"
+                      disabled={undoBusy}
+                      onClick={() => void undoLatestMove()}
+                      style={{
+                        marginLeft: 8,
+                        padding: '0.2rem 0.55rem',
+                        background: '#c62828',
+                        color: 'white',
+                        border: 'none',
+                        borderRadius: 4,
+                        cursor: undoBusy ? 'not-allowed' : 'pointer',
+                      }}
+                    >
+                      {undoBusy ? 'Cofanie…' : 'Cofnij'}
+                    </button>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       )}
       <div className="filters-toolbar">
         <span className="filters-label">{t('common.filters')}</span>

@@ -95,8 +95,11 @@ export default function MachineDetail() {
 
   useEffect(() => {
     if (!id) return;
-    api.machines.get(Number(id)).then(setMachine).finally(() => setLoading(false));
-  }, [id]);
+    api.machines
+      .get(Number(id), scenarioIdFromUrl != null ? { scenarioId: scenarioIdFromUrl } : undefined)
+      .then(setMachine)
+      .finally(() => setLoading(false));
+  }, [id, scenarioIdFromUrl]);
 
   useEffect(() => {
     if (!machine) return;
@@ -187,7 +190,11 @@ export default function MachineDetail() {
             machineId={machine.id}
             machineType={String(machine.type ?? '').trim()}
             alternatives={machine.alternatives ?? []}
-            onUpdate={() => api.machines.get(machine.id).then(setMachine)}
+            onUpdate={() =>
+              api.machines
+                .get(machine.id, scenarioIdFromUrl != null ? { scenarioId: scenarioIdFromUrl } : undefined)
+                .then(setMachine)
+            }
           />
         )}
         {tab === 'materialy' && isBaselineMachine && (
@@ -474,11 +481,32 @@ function MachineDescForm({
   const isBaselineMachine = Boolean(Number(machine.is_baseline));
 
   const executeSave = (payload: Record<string, unknown>) => {
+    const scenarioId = Number(new URLSearchParams(navigationSearch).get('scenarioId'));
+    const inScenario = Number.isFinite(scenarioId) && scenarioId > 0;
+    const prodPayload = { ...payload };
+    const locationWrite =
+      inScenario && 'location' in prodPayload
+        ? api.scenarios.patchMachineLocation(scenarioId, machine.id, {
+            location: (prodPayload.location as string | null) ?? null,
+          })
+        : Promise.resolve(null);
+    const statusRaw = prodPayload.status;
+    const statusWrite =
+      inScenario && (statusRaw === 'active' || statusRaw === 'inactive' || statusRaw === 'RFQ')
+        ? api.scenarios.patchMachineStatus(scenarioId, machine.id, { status: statusRaw })
+        : Promise.resolve(null);
+    if (inScenario) {
+      delete prodPayload.location;
+      delete prodPayload.status;
+    }
     setSaving(true);
-    api.machines
-      .update(machine.id, payload)
-      .then((updated) => {
-        onUpdate(updated);
+    const productionWrite = inScenario ? Promise.resolve(machine) : api.machines.update(machine.id, prodPayload);
+    Promise.all([locationWrite, statusWrite, productionWrite])
+      .then(([loc, st, updated]) => {
+        const location =
+          loc && typeof loc === 'object' && 'location' in loc ? loc.location : updated.location;
+        const status = st && typeof st === 'object' && 'status' in st ? st.status : updated.status;
+        onUpdate({ ...updated, location, status });
         setEditing(false);
       })
       .catch((err) => {
@@ -559,7 +587,8 @@ function MachineDescForm({
     };
 
     const prevStatus = machineStatusFromDb(machine.status);
-    if ((editStatus === 'inactive' || editStatus === 'RFQ') && editStatus !== prevStatus) {
+    const inScenarioNow = Number(new URLSearchParams(navigationSearch).get('scenarioId')) > 0;
+    if (!inScenarioNow && (editStatus === 'inactive' || editStatus === 'RFQ') && editStatus !== prevStatus) {
       try {
         const data = await api.machines.activeProjectOperationCount(machine.id);
         if (data.count > 0) {
@@ -865,6 +894,7 @@ function MachineDescForm({
               value={editStatus}
               onChange={(e) => setEditStatus(e.target.value as MachineEditStatus)}
               title={t('machineDetail.changeStatusTitle')}
+              disabled={saving}
               style={machineStatusSelectStyle(editStatus, { saving })}
             >
               <option value="active">{t('common.active')}</option>

@@ -962,9 +962,9 @@ export default function ScenarioView() {
                           onChange={(e) => updateVolumeDraftRow(row.year, 'volume_unit', e.target.value)}
                           style={{ padding: '0.3rem', border: '1px solid #ccc', borderRadius: 4 }}
                         >
-                          <option value="annual">rocznie</option>
-                          <option value="monthly">miesięcznie</option>
-                          <option value="weekly">tygodniowo</option>
+                          <option value="annual">{t('common.unitAnnualShort')}</option>
+                          <option value="monthly">{t('common.unitMonthlyShort')}</option>
+                          <option value="weekly">{t('common.unitWeeklyShort')}</option>
                         </select>
                       </td>
                     </tr>

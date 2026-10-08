@@ -81,6 +81,11 @@ export type ScenarioAllocationMoveStep = {
   partId: number | null;
   /** Wiersz roku rodzica sprzed ruchu. null = stare wpisy, cofnięcie dodaje wolumen dziecka z powrotem. */
   parentYearBefore: any | null;
+  /** Wartości widoczne w kalkulatorze w chwili ruchu; nowe wpisy raportuje się bez późniejszych przeliczeń. */
+  reportVolumeBefore?: number;
+  reportVolumeRemaining?: number;
+  reportVolumeMoved?: number;
+  reportVolumeUnit?: 'weekly';
 };
 
 export type ScenarioAllocationMove = {

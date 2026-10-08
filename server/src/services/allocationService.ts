@@ -954,6 +954,10 @@ export function executeAllocationInScenario(
     targetMachineId,
     partId: op.part_id != null ? Number(op.part_id) : null,
     parentYearBefore,
+    reportVolumeBefore: currentWeekly,
+    reportVolumeRemaining: Math.max(0, currentWeekly - moveWeekly),
+    reportVolumeMoved: moveWeekly,
+    reportVolumeUnit: 'weekly',
   });
 
   const partLabel = scenarioAssignedPartLabel(bundle, op.part_id != null ? Number(op.part_id) : null);
@@ -1079,12 +1083,6 @@ export type ScenarioMoveListItem = {
   canUndo: boolean;
 };
 
-export type ScenarioMoveTreeNode = {
-  title: string;
-  meta: string;
-  children: ScenarioMoveTreeNode[];
-};
-
 type OrderedMoveStep = NonNullable<ScenarioBundle['allocation_moves']>[number]['steps'][number] & { order: number };
 
 function orderedAllocationSteps(bundle: ScenarioBundle): OrderedMoveStep[] {
@@ -1096,20 +1094,18 @@ function orderedAllocationSteps(bundle: ScenarioBundle): OrderedMoveStep[] {
   return out;
 }
 
-function volumeUnitLabel(unit: unknown): string {
-  if (unit === 'monthly') return 'miesięcznie';
-  if (unit === 'weekly') return 'tygodniowo';
-  return 'rocznie';
-}
-
 function operationYearRow(bundle: ScenarioBundle, operationId: number, year: number): { volume_value?: number; volume_unit?: string } | undefined {
   return (bundle.operation_volume_by_year || []).find(
     (r: any) => Number(r.operation_id) === operationId && Number(r.year) === year
   ) as { volume_value?: number; volume_unit?: string } | undefined;
 }
 
-/** Wolumen, który zszedł ze zwalnianej maszyny w tym roku — łącznie z tym, co poszło dalej. */
-function volumeLeftInYear(bundle: ScenarioBundle, steps: OrderedMoveStep[], step: OrderedMoveStep): Map<string, number> {
+/** Wolumen dziecka po wszystkich dalszych relokacjach, bez podwójnego liczenia operacji pośrednich. */
+function movedVolumeAfterFurtherRelocations(
+  bundle: ScenarioBundle,
+  steps: OrderedMoveStep[],
+  step: OrderedMoveStep
+): { value: number; unit: string } | null {
   const holders = new Set<number>([step.childOperationId]);
   let grew = true;
   while (grew) {
@@ -1134,103 +1130,97 @@ function volumeLeftInYear(bundle: ScenarioBundle, steps: OrderedMoveStep[], step
     const unit = String(row.volume_unit || 'annual');
     byUnit.set(unit, (byUnit.get(unit) || 0) + value);
   }
-  if (byUnit.size > 0) return byUnit;
+  if (byUnit.size === 1) {
+    const [unit, value] = [...byUnit.entries()][0];
+    return { value, unit };
+  }
   const direct = operationYearRow(bundle, step.childOperationId, step.year);
   const directValue = Number(direct?.volume_value);
-  if (Number.isFinite(directValue)) return new Map([[String(direct?.volume_unit || 'annual'), directValue]]);
-  const before = Number(step.parentYearBefore?.volume_value);
-  if (Number.isFinite(before)) return new Map([[String(step.parentYearBefore?.volume_unit || 'annual'), before]]);
-  return new Map();
+  return Number.isFinite(directValue)
+    ? { value: directValue, unit: String(direct?.volume_unit || 'annual') }
+    : null;
 }
 
-function yearVolumeTitle(bundle: ScenarioBundle, steps: OrderedMoveStep[], yearSteps: OrderedMoveStep[]): string {
-  const year = yearSteps[0].year;
-  const byUnit = new Map<string, number>();
-  for (const step of yearSteps) {
-    for (const [unit, value] of volumeLeftInYear(bundle, steps, step)) {
-      if (!Number.isFinite(value)) continue;
-      byUnit.set(unit, (byUnit.get(unit) || 0) + value);
-    }
+export type ScenarioAllocationReportRow = {
+  sourceMachineId: number;
+  sourceMachineLabel: string;
+  targetMachineId: number;
+  targetMachineLabel: string;
+  partId: number | null;
+  partLabel: string;
+  year: number;
+  volumeBefore: number | null;
+  volumeRemaining: number | null;
+  volumeMoved: number | null;
+  volumeUnit: string;
+};
+
+function reportValuesForStep(
+  bundle: ScenarioBundle,
+  steps: OrderedMoveStep[],
+  step: OrderedMoveStep
+): Pick<ScenarioAllocationReportRow, 'volumeBefore' | 'volumeRemaining' | 'volumeMoved' | 'volumeUnit'> {
+  if (
+    Number.isFinite(Number(step.reportVolumeBefore)) &&
+    Number.isFinite(Number(step.reportVolumeRemaining)) &&
+    Number.isFinite(Number(step.reportVolumeMoved))
+  ) {
+    return {
+      volumeBefore: Number(step.reportVolumeBefore),
+      volumeRemaining: Number(step.reportVolumeRemaining),
+      volumeMoved: Number(step.reportVolumeMoved),
+      volumeUnit: String(step.reportVolumeUnit || 'weekly'),
+    };
   }
-  const bits = [...byUnit.entries()].map(([unit, value]) => {
-    const rounded = Math.round(value * 1000) / 1000;
-    return `${rounded} ${volumeUnitLabel(unit)}`;
-  });
-  return bits.length > 0 ? `rok ${year} · ${bits.join('; ')}` : `rok ${year}`;
+  const moved = movedVolumeAfterFurtherRelocations(bundle, steps, step);
+  const beforeValue = Number(step.parentYearBefore?.volume_value);
+  const beforeUnit = String(step.parentYearBefore?.volume_unit || moved?.unit || 'weekly');
+  const sourceNow = operationYearRow(bundle, step.sourceOperationId, step.year);
+  const sourceValue = Number(sourceNow?.volume_value);
+  const sameMovedUnit = moved && moved.unit === beforeUnit ? moved.value : null;
+  const before = Number.isFinite(beforeValue)
+    ? beforeValue
+    : Number.isFinite(sourceValue) && sameMovedUnit != null
+      ? sourceValue + sameMovedUnit
+      : null;
+  const remaining =
+    before != null && sameMovedUnit != null
+      ? Math.max(0, before - sameMovedUnit)
+      : Number.isFinite(sourceValue) && String(sourceNow?.volume_unit || 'weekly') === beforeUnit
+        ? sourceValue
+        : null;
+  return {
+    volumeBefore: before,
+    volumeRemaining: remaining,
+    volumeMoved: sameMovedUnit,
+    volumeUnit: beforeUnit,
+  };
 }
 
-function partYearNodes(bundle: ScenarioBundle, allSteps: OrderedMoveStep[], partSteps: OrderedMoveStep[]): ScenarioMoveTreeNode[] {
-  return groupSteps(partSteps, (step) => String(step.year))
-    .sort((a, b) => a[0].year - b[0].year)
-    .map((yearSteps) => ({
-      title: yearVolumeTitle(bundle, allSteps, yearSteps),
-      meta: '',
-      children: [],
-    }));
-}
-
-function groupSteps(steps: OrderedMoveStep[], key: (step: OrderedMoveStep) => string): OrderedMoveStep[][] {
-  const map = new Map<string, OrderedMoveStep[]>();
-  for (const step of steps) {
-    const k = key(step);
-    const bucket = map.get(k);
-    if (bucket) bucket.push(step);
-    else map.set(k, [step]);
-  }
-  return [...map.values()].sort((a, b) => Math.min(...a.map((s) => s.order)) - Math.min(...b.map((s) => s.order)));
-}
-
-function freedMachineOutline(bundle: ScenarioBundle, steps: OrderedMoveStep[]): ScenarioMoveTreeNode[] {
-  const released = steps.filter((step) => step.sourceMachineId > 0);
-  return groupSteps(released, (step) => String(step.sourceMachineId))
-    .map((machineSteps) => {
-      const machineId = machineSteps[0].sourceMachineId;
-      const parts = groupSteps(machineSteps, (step) => String(step.partId ?? 0))
-        .map((partSteps) => ({
-          title: scenarioAssignedPartLabel(bundle, partSteps[0].partId) || 'detal',
-          meta: '',
-          children: partYearNodes(bundle, steps, partSteps),
-        }))
-        .sort((a, b) => a.title.localeCompare(b.title, 'pl'));
-      return {
-        title: scenarioAssignedMachineLabel(machineId),
-        meta: '',
-        children: parts,
-      };
-    })
-    .filter((node) => node.children.length > 0)
-    .sort((a, b) => a.title.localeCompare(b.title, 'pl'));
-}
-
-function freedPartOutline(bundle: ScenarioBundle, steps: OrderedMoveStep[]): ScenarioMoveTreeNode[] {
-  const released = steps.filter((step) => Number(step.partId) > 0 && step.sourceMachineId > 0);
-  return groupSteps(released, (step) => String(step.partId ?? 0))
-    .map((partSteps) => {
-      const machines = groupSteps(partSteps, (step) => String(step.sourceMachineId))
-        .map((machineSteps) => ({
-          title: scenarioAssignedMachineLabel(machineSteps[0].sourceMachineId),
-          meta: '',
-          children: partYearNodes(bundle, steps, machineSteps),
-        }))
-        .sort((a, b) => a.title.localeCompare(b.title, 'pl'));
-      return {
-        title: scenarioAssignedPartLabel(bundle, partSteps[0].partId) || 'detal',
-        meta: '',
-        children: machines,
-      };
-    })
-    .filter((node) => node.children.length > 0)
-    .sort((a, b) => a.title.localeCompare(b.title, 'pl'));
-}
-
-/** Wszystkie maszyny zwalniane albo wszystkie detale, na jednym widoku. */
-export function buildScenarioAllocationReport(bundle: ScenarioBundle): {
-  machines: ScenarioMoveTreeNode[];
-  parts: ScenarioMoveTreeNode[];
-} {
+/** Płaskie rekordy relokacji; klient buduje widok maszyn lub detali i eksportuje te same dane. */
+export function buildScenarioAllocationReport(bundle: ScenarioBundle): { rows: ScenarioAllocationReportRow[] } {
   collectScenarioAllocationMoves(bundle);
   const steps = orderedAllocationSteps(bundle);
-  return { machines: freedMachineOutline(bundle, steps), parts: freedPartOutline(bundle, steps) };
+  const rows = steps
+    .filter((step) => step.sourceMachineId > 0 && step.targetMachineId > 0)
+    .map((step) => ({
+      sourceMachineId: step.sourceMachineId,
+      sourceMachineLabel: scenarioAssignedMachineLabel(step.sourceMachineId),
+      targetMachineId: step.targetMachineId,
+      targetMachineLabel: scenarioAssignedMachineLabel(step.targetMachineId),
+      partId: step.partId,
+      partLabel: scenarioAssignedPartLabel(bundle, step.partId) || 'detal',
+      year: step.year,
+      ...reportValuesForStep(bundle, steps, step),
+    }))
+    .sort(
+      (a, b) =>
+        a.sourceMachineLabel.localeCompare(b.sourceMachineLabel, 'pl') ||
+        a.targetMachineLabel.localeCompare(b.targetMachineLabel, 'pl') ||
+        a.partLabel.localeCompare(b.partLabel, 'pl') ||
+        a.year - b.year
+    );
+  return { rows };
 }
 
 function moveEndpointLabel(bundle: ScenarioBundle, machineIds: number[]): string {

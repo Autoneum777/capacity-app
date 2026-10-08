@@ -155,10 +155,18 @@ function getVisualSettingsCached(): Promise<VisualSettings> {
   return visualSettingsInFlight;
 }
 
-export type AllocationTreeNode = {
-  title: string;
-  meta: string;
-  children: AllocationTreeNode[];
+export type ScenarioAllocationReportRow = {
+  sourceMachineId: number;
+  sourceMachineLabel: string;
+  targetMachineId: number;
+  targetMachineLabel: string;
+  partId: number | null;
+  partLabel: string;
+  year: number;
+  volumeBefore: number | null;
+  volumeRemaining: number | null;
+  volumeMoved: number | null;
+  volumeUnit: string;
 };
 
 export const api = {
@@ -1678,8 +1686,7 @@ export const api = {
       ),
     allocationReport: (scenarioId: number) =>
       request<{
-        machines: AllocationTreeNode[];
-        parts: AllocationTreeNode[];
+        rows: ScenarioAllocationReportRow[];
       }>(`/scenarios/${scenarioId}/allocation-report`),
     allocationMoves: (scenarioId: number) =>
       request<
